@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {COMMANDS,EVENTS,validateCommand} from '../../src/radar/worker-protocol.js';
+test('protocol command/event names are frozen',()=>{assert.equal(COMMANDS.LOAD_FRAME,'LOAD_FRAME');assert.equal(EVENTS.FRAME_READY,'FRAME_READY');});
+test('LOAD_FRAME validates required fields while allowing automatic elevation choice',()=>{assert.throws(()=>validateCommand({type:'LOAD_FRAME',payload:{}}),/site/);assert.throws(()=>validateCommand({type:'LOAD_FRAME',payload:{site:'KDOX',scanStartMs:1,productId:1}}),/objectKey/);assert.doesNotThrow(()=>validateCommand({type:'LOAD_FRAME',payload:{site:'KDOX',objectKey:'key',scanStartMs:1,elevationNumber:null,productId:1}}));});

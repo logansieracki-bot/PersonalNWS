@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {TimelineModel} from '../../src/timeline/timeline-model.js';
+test('timeline keeps two-hour window and sorts',()=>{const t=new TimelineModel(2*3600e3);const now=10*3600e3;t.setFrames([{scanStartMs:now-3*3600e3},{scanStartMs:now-1000},{scanStartMs:now-3600e3}]);assert.deepEqual(t.frames.map(x=>x.scanStartMs),[now-3600e3,now-1000]);});
+test('previous and next clamp',()=>{const t=new TimelineModel();t.setFrames([{scanStartMs:1},{scanStartMs:2}]);t.setIndex(1);assert.equal(t.previous().scanStartMs,1);assert.equal(t.previous().scanStartMs,1);assert.equal(t.next().scanStartMs,2);});

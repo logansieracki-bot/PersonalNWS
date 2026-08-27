@@ -1,0 +1,4 @@
+export function angularDistance(a,b){const d=Math.abs(a-b)%360;return Math.min(d,360-d);}
+export function buildAzimuthLut(azimuths,stepsPerDegree=10){const size=360*stepsPerDegree;const out=new Uint16Array(size);for(let i=0;i<size;i++){const bearing=i/stepsPerDegree;let best=0,dist=Infinity;for(let r=0;r<azimuths.length;r++){const d=angularDistance(bearing,azimuths[r]);if(d<dist){dist=d;best=r;}}out[i]=best;}return out;}
+export function decodeRawValue(raw,scale,offset){if(raw===0)return {kind:'missing'};if(raw===1)return {kind:'range-folded'};return {kind:'value',value:(raw-offset)/scale};}
+export function mercatorXY(lon,lat){const x=(lon+180)/360;const clamped=Math.max(-85.05112878,Math.min(85.05112878,lat));const r=clamped*Math.PI/180;const y=(1-Math.log(Math.tan(Math.PI/4+r/2))/Math.PI)/2;return [x,y];}
