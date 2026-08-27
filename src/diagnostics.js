@@ -125,6 +125,22 @@ export function buildDiagnosticReport({ state = {}, error = null, entries = diag
   };
 }
 
+export function clearDiagnostic() {
+  if (typeof document === 'undefined') return false;
+  const box = document.getElementById('fatal');
+  const text = document.getElementById('fatalText');
+  const code = document.getElementById('fatalCode');
+  const copy = document.getElementById('fatalCopy');
+  if (box) box.style.display = 'none';
+  if (text) text.textContent = '';
+  if (code) code.textContent = '';
+  if (copy) {
+    copy.textContent = 'Copy Debug Report';
+    copy.onclick = null;
+  }
+  return Boolean(box || text || code || copy);
+}
+
 export function showDiagnostic(error, extra = {}) {
   const d = normalizeDiagnostic(error, extra);
   const entry = diagnosticLog.error(d.stage, d.code, d.message, {

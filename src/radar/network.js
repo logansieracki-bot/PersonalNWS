@@ -47,7 +47,7 @@ export async function fetchArrayBufferWithRetry(url, {
       }
     } catch (error) {
       lastError = error;
-      if (error?.code === 'E_ARCHIVE_TIMEOUT' || attempt === retries) throw error;
+      if (attempt === retries) throw error;
     }
     await sleep(retryDelayMs * (attempt + 1));
   }

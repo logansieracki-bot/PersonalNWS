@@ -72,3 +72,25 @@ test('fatal diagnostics provide a copyable report and identify the running build
   assert.match(source, /clipboard/);
   assert.match(source, /buildId/);
 });
+
+test('clearDiagnostic hides a previous fatal error and resets copy UI', async () => {
+  const { clearDiagnostic } = await import('../../src/diagnostics.js');
+  const nodes = {
+    fatal: { style: { display: 'block' } },
+    fatalText: { textContent: 'old failure' },
+    fatalCode: { textContent: 'E_OLD' },
+    fatalCopy: { textContent: 'Copied', onclick: () => {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = { getElementById(id) { return nodes[id] ?? null; } };
+  try {
+    assert.equal(clearDiagnostic(), true);
+    assert.equal(nodes.fatal.style.display, 'none');
+    assert.equal(nodes.fatalText.textContent, '');
+    assert.equal(nodes.fatalCode.textContent, '');
+    assert.equal(nodes.fatalCopy.textContent, 'Copy Debug Report');
+    assert.equal(nodes.fatalCopy.onclick, null);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});

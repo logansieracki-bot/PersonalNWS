@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { RadarEngineV2 } from '../../src/radar/radar-engine-v2.js';
 
 function deferred() {
@@ -424,4 +425,197 @@ test('a live timer setup failure is logged but never turns a visible radar into 
   assert.equal(result, true);
   assert.equal(engine.preparedVisible, true);
   assert.ok(events.some((event) => event.code === 'LIVE_TIMER_FAILED' && event.stage === 'live'));
+});
+
+test('Level II fallback preserves the original S3 discovery error and does not list twice', async () => {
+  const ui = fakeUi();
+  let listings = 0;
+  const listingError = Object.assign(new Error('S3 list timed out'), { code: 'E_S3_LIST_TIMEOUT', stage: 'listing', sourceId: 'https://bucket.example' });
+  const engine = new RadarEngineV2({
+    ui,
+    fastRenderer: { show: async () => false, hide() {}, reveal() {}, destroy() {} },
+    level2Renderer: { setVisible() {}, setFrame() {} },
+    listFrames: async () => { listings++; throw listingError; },
+    createLevel2Session: async () => { throw new Error('decoder must not start without a frame descriptor'); },
+    pollMs: 0,
+    warmHistoryDelayMs: 0,
+  });
+
+  await assert.rejects(
+    engine.selectSite({ id: 'KDIX', name: 'Philadelphia', lat: 39.9, lon: -74.4 }),
+    (error) => error?.code === 'E_S3_LIST_TIMEOUT' && error?.sourceId === 'https://bucket.example',
+  );
+  assert.equal(listings, 1, 'one failed discovery should not immediately repeat the same S3 listing');
+});
+
+test('prepared first pixels are prioritized before S3 frame discovery starts', async () => {
+  const fast = deferred();
+  let listings = 0;
+  const engine = new RadarEngineV2({
+    ui: fakeUi(),
+    fastRenderer: { show: () => fast.promise, refresh: async () => true, hide() {}, reveal() {} },
+    level2Renderer: { setVisible() {}, setFrame() {} },
+    listFrames: async () => { listings++; return frames(100, 200); },
+    createLevel2Session: async () => { throw new Error('not used'); },
+    pollMs: 0,
+    warmHistoryDelayMs: 0,
+  });
+
+  const selection = engine.selectSite({ id: 'KDIX', name: 'Philadelphia', lat: 39.9, lon: -74.4 });
+  await Promise.resolve();
+  assert.equal(listings, 0, 'S3 discovery must not compete with the prepared first-frame request');
+  fast.resolve(true);
+  assert.equal(await selection, true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(listings, 1, 'history metadata may start only after radar is visible');
+});
+
+test('a prepared live refresh finishing after the user goes historical cannot yank radar back to live', async () => {
+  const refresh = deferred();
+  let current = frames(100, 200);
+  const visibility = [];
+  const engine = new RadarEngineV2({
+    ui: fakeUi(),
+    fastRenderer: {
+      show: async () => true,
+      refresh: () => refresh.promise,
+      hide() { visibility.push('prepared-hide'); },
+      reveal() { visibility.push('prepared-reveal'); },
+    },
+    level2Renderer: {
+      setVisible(value) { visibility.push(`level2-${value}`); },
+      setFrame() {},
+    },
+    listFrames: async () => current,
+    createLevel2Session: async () => ({
+      priority: { request: async (_type, payload) => ({
+        ...payload,
+        manifest: { elevations: [{ number: 1, angle: 0.5, radialCount: 720, products: [1] }] },
+        elevationNumber: 1,
+        productId: 1,
+        buffer: new ArrayBuffer(8),
+      }) },
+      startHistory() {},
+    }),
+    pollMs: 0,
+    warmHistoryDelayMs: 0,
+  });
+  await engine.selectSite({ id: 'KDIX', name: 'Philadelphia', lat: 39.9, lon: -74.4 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const liveRefresh = engine.refreshLive();
+  await Promise.resolve();
+  await engine.loadIndex(0);
+  assert.equal(engine.followLive, false);
+  refresh.resolve(true);
+  await liveRefresh;
+  assert.equal(engine.followLive, false);
+  assert.equal(engine.preparedVisible, false, 'late live refresh must not overwrite a historical Level II frame');
+  assert.notEqual(visibility.at(-1), 'prepared-reveal');
+});
+
+test('worker timeout invalidates the stuck Level II session before fallback tries an earlier scan', async () => {
+  const ui = fakeUi();
+  let sessionCreates = 0;
+  const disposed = [];
+  const requests = [];
+  const engine = new RadarEngineV2({
+    ui,
+    fastRenderer: { show: async () => false, hide() {}, reveal() {}, destroy() {} },
+    level2Renderer: { setVisible() {}, setFrame() {} },
+    listFrames: async () => frames(100, 200, 300),
+    createLevel2Session: async () => {
+      const generation = ++sessionCreates;
+      return {
+        priority: {
+          async request(_type, payload) {
+            requests.push([generation, payload.scanStartMs]);
+            if (generation === 1) {
+              throw Object.assign(new Error('worker timed out'), { code: 'E_WORKER_TIMEOUT', stage: 'worker', sourceId: 'LOAD_FRAME' });
+            }
+            return {
+              ...payload,
+              manifest: { elevations: [{ number: 1, angle: 0.5, products: [1] }] },
+              elevationNumber: 1,
+              productId: 1,
+              buffer: new ArrayBuffer(8),
+            };
+          },
+        },
+        startHistory() {},
+        dispose() { disposed.push(generation); },
+      };
+    },
+    pollMs: 0,
+    warmHistoryDelayMs: 0,
+  });
+
+  assert.equal(await engine.selectSite({ id: 'KDIX', name: 'Philadelphia', lat: 39.9, lon: -74.4 }), true);
+  assert.equal(sessionCreates, 2, 'fallback must get a new worker/session after a worker timeout');
+  assert.deepEqual(requests.slice(0, 2), [[1, 300], [2, 200]]);
+  assert.deepEqual(disposed, [1]);
+});
+
+test('older Level II request cannot overwrite a newer frame selection', async () => {
+  const ui = fakeUi();
+  const pending = new Map();
+  const rendered = [];
+  let requestCount = 0;
+  const makeFrame = (payload) => ({
+    ...payload,
+    manifest: { elevations: [{ number: 1, angle: 0.5, products: [4] }] },
+    elevationNumber: 1,
+    productId: 4,
+    buffer: new ArrayBuffer(8),
+  });
+
+  const priority = {
+    request(_type, payload) {
+      requestCount += 1;
+      if (requestCount === 1) return Promise.resolve(makeFrame(payload)); // initial latest
+      const d = deferred();
+      pending.set(payload.scanStartMs, { ...d, payload });
+      return d.promise;
+    },
+  };
+
+  const engine = new RadarEngineV2({
+    ui,
+    fastRenderer: { show: async () => false, hide() {}, reveal() {}, destroy() {} },
+    level2Renderer: {
+      setVisible() {},
+      setFrame(_buffer, _site, frame) { rendered.push(frame.scanStartMs); },
+    },
+    listFrames: async () => frames(100, 200),
+    createLevel2Session: async () => ({ priority, startHistory() {} }),
+    productId: 4,
+    pollMs: 0,
+    warmHistoryDelayMs: 0,
+  });
+
+  await engine.selectSite({ id: 'KDIX', name: 'Philadelphia', lat: 39.9, lon: -74.4 });
+  assert.deepEqual(rendered, [200]);
+
+  const oldLoad = engine.loadIndex(0);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const newLoad = engine.loadIndex(1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  pending.get(200).resolve(makeFrame(pending.get(200).payload));
+  await newLoad;
+  assert.equal(rendered.at(-1), 200);
+
+  pending.get(100).resolve(makeFrame(pending.get(100).payload));
+  await oldLoad;
+  assert.equal(rendered.at(-1), 200, 'late older response must be ignored');
+  assert.equal(engine.currentIndex, 1);
+});
+
+
+test('background radar work never silently discards rejected promises', () => {
+  const source = fs.readFileSync('src/radar/radar-engine-v2.js', 'utf8');
+  assert.doesNotMatch(source, /\.catch\(\(\)\s*=>\s*\{\s*\}\)/, 'radar engine contains a silent promise rejection');
+  assert.match(source, /FRAME_DISCOVERY_BACKGROUND_FAILED/);
+  assert.match(source, /LIVE_REFRESH_UNHANDLED/);
+  assert.match(source, /LEVEL2_SESSION_DISPOSE_FAILED/);
+  assert.match(source, /LEVEL2_SESSION_RESET_FAILED/);
 });

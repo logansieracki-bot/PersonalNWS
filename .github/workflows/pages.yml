@@ -106,7 +106,8 @@ jobs:
           test -f dist/decoder/personalnws_decoder_bg.wasm
           grep -Fq '<title>PersonalNWS Alpha</title>' dist/index.html
           grep -Fq 'Copy Debug Report' dist/index.html
-          grep -R -Fq '#timeNow{font-size:16px;font-weight:850' dist/assets
+          grep -R -Fq '#timeNow{font-size:17px;font-weight:850' dist/assets
+          grep -R -Fq "$GIT_SHA" dist/assets
           grep -Fq '"release": "Alpha"' dist/build-info.json
           grep -Fq "$GIT_SHA" dist/build-info.json
           echo "Final Pages artifact contains Alpha UI/debug/timestamp changes for $GIT_SHA"

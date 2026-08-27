@@ -9,8 +9,8 @@ export class MemoryRadarCache {
   async ensureVersion(){}
   async putScan(site,start,manifest){this.scans.set(scanKey(site,start),manifest);}
   async getScan(site,start){return this.scans.get(scanKey(site,start));}
-  async putSweep(site,start,elev,product,buffer){this.sweeps.set(sweepKey(site,start,elev,product),buffer);}
-  async getSweep(site,start,elev,product){return this.sweeps.get(sweepKey(site,start,elev,product));}
+  async putSweep(site,start,elev,product,buffer){this.sweeps.set(sweepKey(site,start,elev,product),buffer instanceof ArrayBuffer?buffer.slice(0):buffer);}
+  async getSweep(site,start,elev,product){const buffer=this.sweeps.get(sweepKey(site,start,elev,product));return buffer instanceof ArrayBuffer?buffer.slice(0):buffer;}
 }
 
 export class RadarCache{
@@ -29,11 +29,30 @@ export class RadarCache{
   async getSweep(site,start,elev,product){return req(this.store('sweeps').get(sweepKey(site,start,elev,product)));}
 }
 
-export async function openRadarCache({ openPersistent = () => RadarCache.open(), onFallback = null } = {}) {
+export async function openRadarCache({
+  openPersistent = () => RadarCache.open(),
+  onFallback = null,
+  timeoutMs = 2_500,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
+  let timer = null;
   try {
-    return await openPersistent();
+    const persistent = Promise.resolve().then(() => openPersistent());
+    if (!(timeoutMs > 0)) return await persistent;
+    const timeout = new Promise((_, reject) => {
+      timer = Reflect.apply(setTimeoutImpl, globalThis, [() => reject(Object.assign(
+        new Error(`IndexedDB radar cache did not open within ${timeoutMs} ms`),
+        { code: 'E_CACHE_OPEN_TIMEOUT', stage: 'cache', context: { timeoutMs } },
+      )), timeoutMs]);
+    });
+    return await Promise.race([persistent, timeout]);
   } catch (error) {
     onFallback?.(error);
     return new MemoryRadarCache();
+  } finally {
+    if (timer != null) {
+      try { Reflect.apply(clearTimeoutImpl, globalThis, [timer]); } catch {}
+    }
   }
 }

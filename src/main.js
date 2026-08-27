@@ -4,14 +4,15 @@ import './ui/styles.css';
 import { APP_RELEASE_LABEL, APP_VERSION, BUILD_ID } from './config.js';
 import { loadRadarSites } from './radar/site-catalog.js';
 import { discoverRecentFrames } from './radar/frame-catalog.js';
-import { WorkerClient } from './radar/worker-client.js';
-import { EVENTS } from './radar/worker-protocol.js';
 import { resolveDecoderBase } from './radar/wasm-loader.js';
-import { initializeRadarWorkers } from './radar/startup.js';
+import { waitForMapReady } from './radar/startup.js';
 import { RadarEngineV2 } from './radar/radar-engine-v2.js';
+import { createLazyLevel2SessionFactory } from './radar/level2-session-factory.js';
 import { RadarLayer } from './render/radar-layer.js';
 import { FastRadarLayer } from './render/fast-radar-layer.js';
 import { createUI } from './ui/ui-adapter.js';
+import { runUiAction } from './ui/action-runner.js';
+import { createSingleFlight } from './ui/single-flight.js';
 import { installRadarMarkers } from './ui/radar-markers.js';
 import { diagnosticLog, buildDiagnosticReport, showDiagnostic } from './diagnostics.js';
 
@@ -31,6 +32,18 @@ const debugApi = {
     if (!site) throw new Error(`radar ${id} is not in the active catalog`);
     map?.flyTo({ center: [site.lon, site.lat], zoom: Math.max(map.getZoom(), 6), duration: 450 });
     return app.selectSite(site);
+  },
+  focusSiteById(id) {
+    const site = sites.find((s) => s.id === String(id).toUpperCase());
+    if (!site) throw new Error(`radar ${id} is not in the active catalog`);
+    map?.jumpTo({ center: [site.lon, site.lat], zoom: Math.max(map.getZoom(), 6) });
+    return true;
+  },
+  screenPointForSite(id) {
+    const site = sites.find((s) => s.id === String(id).toUpperCase());
+    if (!site) throw new Error(`radar ${id} is not in the active catalog`);
+    const point = map?.project?.([site.lon, site.lat]);
+    return point ? { x: point.x, y: point.y } : null;
   },
   async forceLevel2Latest() {
     if (!app?.site) throw new Error('select a radar first');
@@ -79,83 +92,15 @@ window.addEventListener('unhandledrejection', (event) => {
   diagnosticLog.error(reason?.stage ?? 'browser', reason?.code ?? 'E_UNHANDLED_REJECTION', String(reason?.message ?? reason ?? 'Unhandled promise rejection'), { sourceId: reason?.sourceId ?? '' }, reason);
 });
 
-function onceMapLoad(instance) {
-  return new Promise((resolve) => {
-    if (instance.loaded()) return resolve();
-    instance.once('load', resolve);
-  });
-}
-
-function createLazyLevel2SessionFactory(decoderBase) {
-  let sessionPromise = null;
-  return () => {
-    if (sessionPromise) return sessionPromise;
-    sessionPromise = (async () => {
-      const priorityWorker = new Worker(new URL('./radar/priority-worker.js', import.meta.url), { type: 'module', name: 'personalnws-priority' });
-      const priority = new WorkerClient(priorityWorker, { timeoutMs: 45_000, diagnostics: diagnosticLog, role: 'priority' });
-      priority.on(EVENTS.METRICS, (entry) => diagnosticLog.record(entry?.level ?? 'debug', entry?.stage ?? 'worker', entry?.code ?? 'WORKER_METRIC', entry?.message ?? 'Worker metric', entry?.context ?? {}, entry?.error ?? null));
-      priority.on(EVENTS.DIAGNOSTIC, (error) => diagnosticLog.error(error?.stage ?? 'worker', error?.code ?? 'E_WORKER', error?.message ?? 'Priority worker diagnostic', { ...(error?.context ?? {}), sourceId: error?.sourceId ?? '', role: 'priority' }, error));
-      await initializeRadarWorkers({ priority, decoderBase });
-
-      let historyWorker = null;
-      let history = null;
-      let historyReady = null;
-      let historyRun = null;
-      let historyKey = '';
-
-      const ensureHistory = () => {
-        if (historyReady) return historyReady;
-        historyReady = (async () => {
-          historyWorker = new Worker(new URL('./radar/history-worker.js', import.meta.url), { type: 'module', name: 'personalnws-history' });
-          history = new WorkerClient(historyWorker, { timeoutMs: 120_000, diagnostics: diagnosticLog, role: 'history' });
-          history.on(EVENTS.CACHE_PROGRESS, ({ done, total }) => ui.cacheProgress(done, total));
-          history.on(EVENTS.METRICS, (entry) => diagnosticLog.record(entry?.level ?? 'debug', entry?.stage ?? 'history', entry?.code ?? 'WORKER_METRIC', entry?.message ?? 'History worker metric', entry?.context ?? {}, entry?.error ?? null));
-          history.on(EVENTS.DIAGNOSTIC, (error) => { diagnosticLog.warn(error?.stage ?? 'history', error?.code ?? 'E_HISTORY', error?.message ?? 'History worker diagnostic', { ...(error?.context ?? {}), sourceId: error?.sourceId ?? '', role: 'history' }, error); console.warn('[PersonalNWS history]', error); });
-          await initializeRadarWorkers({ priority: history, decoderBase });
-          return history;
-        })().catch((error) => {
-          console.warn('[PersonalNWS history init]', error);
-          historyReady = null;
-          throw error;
-        });
-        return historyReady;
-      };
-
-      const startHistory = (payload) => {
-        if (!payload?.frames?.length) return Promise.resolve(null);
-        const latest = payload.frames.at(-1)?.scanStartMs ?? 0;
-        const key = `${payload.site}|${payload.productId}|${payload.elevationNumber ?? 'auto'}|${payload.frames.length}|${latest}`;
-        if (historyRun && historyKey === key) return historyRun;
-        if (historyRun) return historyRun; // don't launch overlapping volume backfills
-        historyKey = key;
-        historyRun = ensureHistory()
-          .then((client) => client.request('START_HISTORY', payload))
-          .catch((error) => console.warn('[PersonalNWS history backfill]', error))
-          .finally(() => { historyRun = null; });
-        return historyRun;
-      };
-
-      return {
-        priority,
-        startHistory,
-        dispose() {
-          try { priorityWorker.terminate(); } catch {}
-          try { historyWorker?.terminate(); } catch {}
-        },
-      };
-    })().catch((error) => {
-      sessionPromise = null;
-      throw error;
-    });
-    return sessionPromise;
-  };
+function performUiAction(action, fn, context = {}) {
+  return runUiAction(action, fn, { diagnostics: diagnosticLog, ui, context });
 }
 
 async function boot() {
   const bootStarted = Date.now();
   diagnosticLog.info('boot', 'BOOT_START', `Starting PersonalNWS ${APP_RELEASE_LABEL}`, { version: APP_VERSION, release: APP_RELEASE_LABEL, buildId: BUILD_ID });
   ui.setStream('· starting');
-  const sitesPromise = loadRadarSites();
+  const sitesPromise = loadRadarSites({ diagnostics: diagnosticLog, timeoutMs: 5_000 });
 
   map = new maplibregl.Map({
     container: 'map',
@@ -166,17 +111,17 @@ async function boot() {
     keyboard: false,
     canvasContextAttributes: { antialias: false },
   });
-  await onceMapLoad(map);
+  await waitForMapReady(map, { timeoutMs: 10_000 });
   diagnosticLog.info('map', 'MAP_READY', 'MapLibre base map ready', { elapsedMs: Date.now() - bootStarted });
 
   const firstSymbol = map.getStyle()?.layers?.find((layer) => layer.type === 'symbol')?.id;
-  radarLayer = new RadarLayer();
+  radarLayer = new RadarLayer({ diagnostics: diagnosticLog });
   radarLayer.setVisible(false);
   map.addLayer(radarLayer, firstSymbol);
   fastRadarLayer = new FastRadarLayer(map, { beforeLayerId: firstSymbol, loadTimeoutMs: 3_500, diagnostics: diagnosticLog });
 
   const decoderBase = resolveDecoderBase(document.baseURI);
-  const createLevel2Session = createLazyLevel2SessionFactory(decoderBase);
+  const createLevel2Session = createLazyLevel2SessionFactory({ decoderBase, ui, diagnostics: diagnosticLog });
   const listFrames = (siteId) => discoverRecentFrames(siteId, { nowMs: Date.now(), timeoutMs: 3_500 });
 
   app = new RadarEngineV2({
@@ -195,24 +140,25 @@ async function boot() {
   diagnosticLog.info('catalog', 'CATALOG_READY', `Loaded ${sites.length} radar sites`, { siteCount: sites.length, elapsedMs: Date.now() - bootStarted });
   installRadarMarkers(map, sites, (site) => {
     map.flyTo({ center: [site.lon, site.lat], zoom: Math.max(map.getZoom(), 6), duration: 450 });
-    app.selectSite(site).catch(() => {});
+    void performUiAction('marker-select', () => app.selectSite(site), { site: site.id });
   });
 
   const timeline = document.getElementById('timeline');
-  timeline?.addEventListener('change', () => app.loadIndex(Number(timeline.value)).catch(() => {}));
-  document.getElementById('product')?.addEventListener('change', (event) => app.setProduct(Number(event.target.value)).catch(() => {}));
-  document.getElementById('tilt')?.addEventListener('change', (event) => app.setElevation(Number(event.target.value)).catch(() => {}));
+  timeline?.addEventListener('change', () => { void performUiAction('timeline-change', () => app.loadIndex(Number(timeline.value)), { index: Number(timeline.value), site: app?.site?.id ?? '' }); });
+  document.getElementById('product')?.addEventListener('change', (event) => { const productId = Number(event.target.value); void performUiAction('product-change', () => app.setProduct(productId), { productId, site: app?.site?.id ?? '' }); });
+  document.getElementById('tilt')?.addEventListener('change', (event) => { const elevationNumber = Number(event.target.value); void performUiAction('tilt-change', () => app.setElevation(elevationNumber), { elevationNumber, site: app?.site?.id ?? '' }); });
 
   document.addEventListener('keydown', (event) => {
     if (!app?.frames?.length) return;
     const tag = event.target?.tagName?.toLowerCase();
     if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
-    if (event.key === 'ArrowLeft') { event.preventDefault(); app.loadIndex(app.currentIndex - 1).catch(() => {}); }
-    else if (event.key === 'ArrowRight') { event.preventDefault(); app.loadIndex(app.currentIndex + 1).catch(() => {}); }
+    if (event.key === 'ArrowLeft') { event.preventDefault(); void performUiAction('keyboard-previous', () => app.loadIndex(app.currentIndex - 1), { site: app?.site?.id ?? '' }); }
+    else if (event.key === 'ArrowRight') { event.preventDefault(); void performUiAction('keyboard-next', () => app.loadIndex(app.currentIndex + 1), { site: app?.site?.id ?? '' }); }
     else if (event.code === 'Space') { event.preventDefault(); document.getElementById('play')?.click(); }
   }, { passive: false });
 
   let playTimer = null;
+  const playbackFlight = createSingleFlight();
   const playButton = document.getElementById('play');
   playButton?.addEventListener('click', () => {
     if (playTimer) { clearInterval(playTimer); playTimer = null; playButton.textContent = 'Play'; return; }
@@ -221,7 +167,7 @@ async function boot() {
     playTimer = setInterval(() => {
       if (!app.frames.length) return;
       const next = app.currentIndex >= app.frames.length - 1 ? 0 : app.currentIndex + 1;
-      app.loadIndex(next).catch(() => {});
+      void playbackFlight.run(() => performUiAction('playback-step', () => app.loadIndex(next), { index: next, site: app?.site?.id ?? '' }));
     }, Math.max(100, 900 / speed()));
   });
 

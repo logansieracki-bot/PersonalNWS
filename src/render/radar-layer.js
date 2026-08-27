@@ -73,23 +73,65 @@ void main(){
   fragColor=colorFor(physical);
 }`;
 
-function shader(gl,type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){const log=gl.getShaderInfoLog(s);gl.deleteShader(s);throw new Error(`radar shader compile failed: ${log}`);}return s;}
-function program(gl){const p=gl.createProgram(),v=shader(gl,gl.VERTEX_SHADER,VS),f=shader(gl,gl.FRAGMENT_SHADER,FS);gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);gl.deleteShader(v);gl.deleteShader(f);if(!gl.getProgramParameter(p,gl.LINK_STATUS)){const log=gl.getProgramInfoLog(p);gl.deleteProgram(p);throw new Error(`radar program link failed: ${log}`);}return p;}
+function renderSetupError(message, code, context = {}) {
+  return Object.assign(new Error(message), { code, stage: 'render', sourceId: '', context });
+}
+function shader(gl,type,src){
+  const shaderType=type===gl.VERTEX_SHADER?'vertex':type===gl.FRAGMENT_SHADER?'fragment':String(type);
+  const s=gl.createShader(type);
+  if(!s)throw renderSetupError(`WebGL could not create the ${shaderType} radar shader`,'E_GL_SHADER',{shaderType});
+  gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+    const log=gl.getShaderInfoLog(s)??'';gl.deleteShader(s);
+    throw renderSetupError(`Radar ${shaderType} shader compilation failed: ${log}`,'E_GL_SHADER',{shaderType,shaderLog:log});
+  }
+  return s;
+}
+function program(gl){
+  const v=shader(gl,gl.VERTEX_SHADER,VS);
+  let f;
+  try{f=shader(gl,gl.FRAGMENT_SHADER,FS);}catch(error){gl.deleteShader(v);throw error;}
+  const p=gl.createProgram();
+  if(!p){gl.deleteShader(v);gl.deleteShader(f);throw renderSetupError('WebGL could not create the radar shader program','E_GL_PROGRAM');}
+  gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);gl.deleteShader(v);gl.deleteShader(f);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+    const log=gl.getProgramInfoLog(p)??'';gl.deleteProgram(p);
+    throw renderSetupError(`Radar shader program link failed: ${log}`,'E_GL_PROGRAM',{programLog:log});
+  }
+  return p;
+}
 function bbox(site,km){const latDelta=km/110.574;const lonDelta=km/(111.320*Math.max(.15,Math.cos(site.lat*Math.PI/180)));const south=Math.max(-85,site.lat-latDelta),north=Math.min(85,site.lat+latDelta);const west=site.lon-lonDelta,east=site.lon+lonDelta;const [xw,yn]=mercatorXY(west,north),[xe,ys]=mercatorXY(east,south);return new Float32Array([xw,yn,xe,yn,xw,ys,xe,ys]);}
 
 export class RadarLayer {
-  constructor(){this.id='personalnws-radar';this.type='custom';this.renderingMode='2d';this.pending=null;this.sweep=null;this.site=null;this.gl=null;this.map=null;this.renderCount=0;this.lastGlError=0;this.visible=true;}
+  constructor({diagnostics=null}={}){this.diagnostics=diagnostics;this.id='personalnws-radar';this.type='custom';this.renderingMode='2d';this.pending=null;this.sweep=null;this.site=null;this.gl=null;this.map=null;this.renderCount=0;this.lastGlError=0;this.lastReportedGlError=0;this.visible=true;}
   setVisible(visible){this.visible=Boolean(visible);this.map?.triggerRepaint();}
-  onAdd(map,gl){if(typeof WebGL2RenderingContext!=='undefined'&&!(gl instanceof WebGL2RenderingContext))throw new Error('PersonalNWS radar requires WebGL2');this.map=map;this.gl=gl;this.program=program(gl);this.buffer=gl.createBuffer();this.gateTexture=gl.createTexture();this.lutTexture=gl.createTexture();this.aPos=gl.getAttribLocation(this.program,'a_pos');this.uniforms=Object.fromEntries(['u_matrix','u_gates','u_azlut','u_site_lat','u_site_lon','u_first_gate','u_gate_interval','u_max_range','u_mean_elev','u_scale','u_offset','u_gate_count','u_product'].map(n=>[n,gl.getUniformLocation(this.program,n)]));if(this.pending)this.#upload();}
-  setFrame(buffer,site){const sweep=readSweepBlob(buffer);this.pending={sweep,site};if(this.gl)this.#upload();this.map?.triggerRepaint();return sweep;}
-  #upload(){const gl=this.gl,{sweep,site}=this.pending;this.pending=null;this.sweep=sweep;this.site=site;const verts=bbox(site,sweep.maxRangeKm);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffer);gl.bufferData(gl.ARRAY_BUFFER,verts,gl.DYNAMIC_DRAW);
+  onAdd(map,gl){
+    this.map=map;this.gl=gl;
+    try{
+      if(typeof WebGL2RenderingContext!=='undefined'&&!(gl instanceof WebGL2RenderingContext))throw renderSetupError('PersonalNWS radar requires WebGL2','E_GL_VERSION');
+      this.program=program(gl);
+      this.buffer=gl.createBuffer();this.gateTexture=gl.createTexture();this.lutTexture=gl.createTexture();
+      this.aPos=gl.getAttribLocation(this.program,'a_pos');
+      this.uniforms=Object.fromEntries(['u_matrix','u_gates','u_azlut','u_site_lat','u_site_lon','u_first_gate','u_gate_interval','u_max_range','u_mean_elev','u_scale','u_offset','u_gate_count','u_product'].map(n=>[n,gl.getUniformLocation(this.program,n)]));
+      if(this.pending)this.#upload();
+    }catch(error){
+      const code=error?.code??'E_GL_SETUP';const context=error?.context??{};
+      try{this.diagnostics?.record?.('error','render',code,error?.message??'Radar WebGL setup failed',context,error);}catch{}
+      throw error;
+    }
+  }
+  setFrame(buffer,site,frame=null){const sweep=readSweepBlob(buffer);this.pending={sweep,site,frame};if(this.gl)this.#upload();this.map?.triggerRepaint();return sweep;}
+  #upload(){const gl=this.gl,{sweep,site,frame}=this.pending;this.pending=null;const verts=bbox(site,sweep.maxRangeKm);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffer);gl.bufferData(gl.ARRAY_BUFFER,verts,gl.DYNAMIC_DRAW);
     gl.bindTexture(gl.TEXTURE_2D,this.gateTexture);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
     if(sweep.wordBytes===1)gl.texImage2D(gl.TEXTURE_2D,0,gl.R8UI,sweep.gateCount,sweep.radialCount,0,gl.RED_INTEGER,gl.UNSIGNED_BYTE,sweep.gates);else gl.texImage2D(gl.TEXTURE_2D,0,gl.R16UI,sweep.gateCount,sweep.radialCount,0,gl.RED_INTEGER,gl.UNSIGNED_SHORT,sweep.gates);
     const lut=buildAzimuthLut(sweep.azimuths,10);gl.bindTexture(gl.TEXTURE_2D,this.lutTexture);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,gl.R16UI,3600,1,0,gl.RED_INTEGER,gl.UNSIGNED_SHORT,lut);
+    const glError=typeof gl.getError==='function'?gl.getError():0;this.lastGlError=glError||0;
+    if(glError){const error=Object.assign(new Error(`WebGL radar texture upload failed with error ${glError}`),{code:'E_GL_UPLOAD',stage:'render',sourceId:site?.id??'',context:{site:site?.id??'',productId:frame?.productId??sweep.productId,elevationNumber:frame?.elevationNumber??sweep.elevationNumber,glError}});try{this.diagnostics?.record?.('error','render','E_GL_UPLOAD',error.message,error.context,error);}catch{}throw error;}
+    this.sweep=sweep;this.site=site;
   }
   render(gl,args){if(!this.visible||!this.sweep||!this.site)return;const matrix=args?.defaultProjectionData?.mainMatrix??args?.modelViewProjectionMatrix;if(!matrix)return;const s=this.sweep;gl.useProgram(this.program);gl.uniformMatrix4fv(this.uniforms.u_matrix,false,matrix);gl.bindBuffer(gl.ARRAY_BUFFER,this.buffer);gl.enableVertexAttribArray(this.aPos);gl.vertexAttribPointer(this.aPos,2,gl.FLOAT,false,0,0);
     gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,this.gateTexture);gl.uniform1i(this.uniforms.u_gates,0);gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,this.lutTexture);gl.uniform1i(this.uniforms.u_azlut,1);
-    gl.uniform1f(this.uniforms.u_site_lat,this.site.lat*Math.PI/180);gl.uniform1f(this.uniforms.u_site_lon,this.site.lon*Math.PI/180);gl.uniform1f(this.uniforms.u_first_gate,s.firstGateKm);gl.uniform1f(this.uniforms.u_gate_interval,s.gateIntervalKm);gl.uniform1f(this.uniforms.u_max_range,s.maxRangeKm);gl.uniform1f(this.uniforms.u_mean_elev,s.meanElevation*Math.PI/180);gl.uniform1f(this.uniforms.u_scale,s.scale);gl.uniform1f(this.uniforms.u_offset,s.offset);gl.uniform1i(this.uniforms.u_gate_count,s.gateCount);gl.uniform1i(this.uniforms.u_product,s.productId);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);this.renderCount++;this.lastGlError=gl.getError();
+    gl.uniform1f(this.uniforms.u_site_lat,this.site.lat*Math.PI/180);gl.uniform1f(this.uniforms.u_site_lon,this.site.lon*Math.PI/180);gl.uniform1f(this.uniforms.u_first_gate,s.firstGateKm);gl.uniform1f(this.uniforms.u_gate_interval,s.gateIntervalKm);gl.uniform1f(this.uniforms.u_max_range,s.maxRangeKm);gl.uniform1f(this.uniforms.u_mean_elev,s.meanElevation*Math.PI/180);gl.uniform1f(this.uniforms.u_scale,s.scale);gl.uniform1f(this.uniforms.u_offset,s.offset);gl.uniform1i(this.uniforms.u_gate_count,s.gateCount);gl.uniform1i(this.uniforms.u_product,s.productId);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);this.renderCount++;this.lastGlError=typeof gl.getError==='function'?gl.getError():0;if(this.lastGlError&&this.lastGlError!==this.lastReportedGlError){this.lastReportedGlError=this.lastGlError;const context={site:this.site?.id??'',productId:s.productId,elevationNumber:s.elevationNumber,glError:this.lastGlError};try{this.diagnostics?.record?.('error','render','E_GL_RENDER',`WebGL radar draw failed with error ${this.lastGlError}`,context);}catch{}}else if(!this.lastGlError){this.lastReportedGlError=0;}
   }
   onRemove(_map,gl){for(const x of [this.buffer,this.gateTexture,this.lutTexture,this.program])if(x){if(x===this.buffer)gl.deleteBuffer(x);else if(x===this.program)gl.deleteProgram(x);else gl.deleteTexture(x);}}
 }

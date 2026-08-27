@@ -1,4 +1,4 @@
-import { LEVEL2_ARCHIVE_BASE, LEVEL2_CHUNKS_BASE } from '../config.js';
+import { LEVEL2_ARCHIVE_BASE } from '../config.js';
 
 const pad = (n) => String(n).padStart(2, '0');
 const XML_ENTITIES = Object.freeze({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" });
@@ -41,7 +41,7 @@ function pageInfo(xml) {
   };
 }
 
-function fetchListPage(url, { fetchImpl = fetch, timeoutMs = 5_000 } = {}) {
+async function fetchListPage(url, { fetchImpl = fetch, timeoutMs = 5_000 } = {}) {
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -52,8 +52,16 @@ function fetchListPage(url, { fetchImpl = fetch, timeoutMs = 5_000 } = {}) {
       }));
     }, timeoutMs);
   });
-  const request = fetchImpl(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) });
-  return Promise.race([request, timeout]).finally(() => clearTimeout(timer));
+  try {
+    const response = await Promise.race([
+      Promise.resolve(fetchImpl(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) })),
+      timeout,
+    ]);
+    const xml = await Promise.race([Promise.resolve(response.text()), timeout]);
+    return { response, xml };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function list(base, prefix, fetchImpl = fetch, timeoutMs = 5_000) {
@@ -64,13 +72,12 @@ async function list(base, prefix, fetchImpl = fetch, timeoutMs = 5_000) {
     u.searchParams.set('list-type', '2');
     u.searchParams.set('prefix', prefix);
     if (continuationToken) u.searchParams.set('continuation-token', continuationToken);
-    const r = await fetchListPage(u, { fetchImpl, timeoutMs });
+    const { response: r, xml } = await fetchListPage(u, { fetchImpl, timeoutMs });
     if (!r.ok) {
       const error = new Error(`S3 list HTTP ${r.status}`);
       error.code = 'E_S3_LIST'; error.stage = 'listing'; error.sourceId = u.href;
       throw error;
     }
-    const xml = await r.text();
     out.push(...parseS3List(xml));
     const info = pageInfo(xml);
     if (!info.truncated) return out;
@@ -100,5 +107,3 @@ export async function listCompletedVolumes(site, startMs, endMs, { fetchImpl = f
 }
 
 export function archiveObjectUrl(key) { return `${LEVEL2_ARCHIVE_BASE}/${key}`; }
-export async function listRealtimeChunks(site, { fetchImpl = fetch, timeoutMs = 5_000 } = {}) { return list(LEVEL2_CHUNKS_BASE, `${site}/`, fetchImpl, timeoutMs); }
-export function chunkObjectUrl(key) { return `${LEVEL2_CHUNKS_BASE}/${key}`; }

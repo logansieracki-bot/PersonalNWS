@@ -5,6 +5,7 @@ function structured(error) {
     sourceId: error?.sourceId ?? '',
     message: String(error?.message ?? error ?? 'Unknown worker error'),
     detail: String(error?.detail ?? error?.stack ?? error?.message ?? error ?? 'Unknown worker error'),
+    context: error?.context ?? {},
   };
 }
 
@@ -23,8 +24,7 @@ export function createWorkerRuntime({ core, post }) {
     if (!id) return;
     try {
       let result;
-      if (type === 'SELECT_SITE') result = await core.selectSite(payload);
-      else if (type === 'LOAD_FRAME') result = await core.loadFrame(payload);
+      if (type === 'LOAD_FRAME') result = await core.loadFrame(payload);
       else if (type === 'PING') result = { pong: true };
       else throw Object.assign(new Error(`unsupported worker command ${type}`), { code: 'E_PROTOCOL', stage: 'worker' });
       post({ replyTo: id, ok: true, payload: result }, transfersFor(result));

@@ -70,7 +70,10 @@ test('CURRENT radar proves prepared NWS imagery first, then Level II WASM and re
       && response.status() === 200;
   }, { timeout: 20_000 });
 
-  await page.evaluate((id) => window.__PERSONALNWS__.selectSiteById(id), site);
+  await page.evaluate((id) => window.__PERSONALNWS__.focusSiteById(id), site);
+  const markerPoint = await page.evaluate((id) => window.__PERSONALNWS__.screenPointForSite(id), site);
+  if (!markerPoint) throw new Error(`Could not project radar marker for ${site}`);
+  await page.mouse.click(markerPoint.x, markerPoint.y);
   const fastResponse = await fastTileResponse;
   const fastContentType = fastResponse.headers()['content-type'] ?? '';
   if (!/image\/png/i.test(fastContentType)) {

@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import { findCurrentVolume } from './current-smoke-lib.mjs';
+import { fetchArrayBufferWithRetry } from '../src/radar/network.js';
 
-const sites = (process.env.PERSONALNWS_SMOKE_SITES || 'KTLX,KDOX,KATX,PAHG,PHKI,TJUA')
+const sites = (process.env.PERSONALNWS_SMOKE_SITES || 'KDIX,KDOX,KTLX,KATX,PAHG,PHKI,TJUA,PGUA')
   .split(',')
   .map((s) => s.trim().toUpperCase())
   .filter(Boolean);
@@ -11,9 +12,11 @@ if (!found) {
   throw new Error(`no current Level II volume found for smoke sites: ${sites.join(', ')}`);
 }
 
-const response = await fetch(found.url, { cache: 'no-store' });
-if (!response.ok) throw new Error(`current Level II object HTTP ${response.status}: ${found.url}`);
-const bytes = new Uint8Array(await response.arrayBuffer());
+const bytes = new Uint8Array(await fetchArrayBufferWithRetry(found.url, {
+  retries: 1,
+  timeoutMs: 20_000,
+  retryDelayMs: 500,
+}));
 if (bytes.byteLength < 100_000) {
   throw new Error(`current Level II smoke object is unexpectedly small (${bytes.byteLength} bytes): ${found.key}`);
 }

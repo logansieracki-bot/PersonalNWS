@@ -2,6 +2,19 @@ import { buildFastRadarTileUrl } from '../radar/fast-radar-source.js';
 
 const DEFAULT_OPACITY = 0.78;
 
+function radarBounds(site, rangeKm = 500) {
+  const lat = Number(site?.lat), lon = Number(site?.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  const latDelta = rangeKm / 110.574;
+  const lonDelta = rangeKm / (111.320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+  return [
+    Math.max(-180, lon - lonDelta),
+    Math.max(-85, lat - latDelta),
+    Math.min(180, lon + lonDelta),
+    Math.min(85, lat + latDelta),
+  ];
+}
+
 function makeFastError(code, message, context = {}, detail = '') {
   const error = new Error(message);
   error.code = code;
@@ -55,10 +68,12 @@ export class FastRadarLayer {
       firstLoad: first,
     });
 
+    const bounds = radarBounds(site);
     this.map.addSource(sourceId, {
       type: 'raster',
       tiles,
       tileSize: 256,
+      ...(bounds ? { bounds } : {}),
       attribution: 'NOAA / NWS',
     });
     this.map.addLayer({
@@ -72,6 +87,13 @@ export class FastRadarLayer {
     }, this.beforeLayerId);
 
     const result = await this.#waitForSource(sourceId, { site: site.id, productId: Number(productId), tileUrl, started });
+    if (slot !== this.sequence) {
+      this.#remove(layerId, sourceId);
+      this.#log('debug', 'fast-radar', 'FAST_SOURCE_STALE', `Ignoring stale prepared radar source for ${site.id}`, {
+        site: site.id, productId: Number(productId), sourceId, elapsedMs: this.now() - started,
+      });
+      return false;
+    }
     if (!result.ok) {
       this.lastFailure = result.error;
       this.#log('warn', 'fast-radar', result.error.code, result.error.message, result.error.context, result.error);

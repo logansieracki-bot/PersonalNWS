@@ -133,3 +133,35 @@ test('fast radar timeout preserves a structured failure with station/source timi
   assert.equal(fast.lastFailure?.context?.site, 'KDIX');
   assert.ok(events.some((event) => event.code === 'E_FAST_TIMEOUT' && event.context.site === 'KDIX'));
 });
+
+test('a slower older prepared-radar request cannot replace a newer completed request', async () => {
+  const map = new FakeMap();
+  const fast = new FastRadarLayer(map, { loadTimeoutMs: 100 });
+  const first = fast.show({ site: { id: 'KDIX' }, productId: 1, cacheToken: 1 });
+  const firstSource = [...map.sources.keys()][0];
+  const second = fast.show({ site: { id: 'KDIX' }, productId: 2, cacheToken: 2 });
+  const secondSource = [...map.sources.keys()].find((id) => id !== firstSource);
+
+  map.markLoaded(secondSource);
+  assert.equal(await second, true);
+  const winningLayer = fast.activeLayerId;
+
+  map.markLoaded(firstSource);
+  assert.equal(await first, false, 'stale request should be ignored rather than committed');
+  assert.equal(fast.activeLayerId, winningLayer, 'newer prepared radar must remain active');
+  assert.equal(map.getSource(firstSource), undefined, 'stale staged source is cleaned up');
+});
+
+test('prepared radar raster source is geographically bounded around the selected station to avoid useless world-tile requests', async () => {
+  const map = new FakeMap();
+  const fast = new FastRadarLayer(map, { loadTimeoutMs: 100 });
+  const pending = fast.show({ site: { id:'KDIX', lat:39.947, lon:-74.411 }, productId:1, cacheToken:1 });
+  const [sourceId] = map.sources.keys();
+  const source = map.getSource(sourceId);
+  assert.equal(Array.isArray(source.bounds), true);
+  assert.equal(source.bounds.length, 4);
+  assert.ok(source.bounds[0] < -74.411 && source.bounds[2] > -74.411);
+  assert.ok(source.bounds[1] < 39.947 && source.bounds[3] > 39.947);
+  map.markLoaded(sourceId);
+  assert.equal(await pending, true);
+});

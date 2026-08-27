@@ -76,3 +76,20 @@ test('deploy job verifies the actual live Pages origin serves this commit', () =
   assert.match(workflow, /PersonalNWS Alpha/);
   assert.match(workflow, /GITHUB_SHA/);
 });
+
+test('browser release proof clicks the actual MapLibre radar marker instead of bypassing UI selection', () => {
+  const browserSmoke = fs.readFileSync('tests/browser/real-frame.spec.js', 'utf8');
+  assert.match(browserSmoke, /page\.mouse\.click/);
+  assert.doesNotMatch(browserSmoke, /selectSiteById\(id\)/);
+});
+
+test('current smoke rotation includes KDIX while retaining geographically diverse sites', () => {
+  const smoke = fs.readFileSync('scripts/fetch-current-smoke-volume.mjs', 'utf8');
+  assert.match(smoke, /KDIX/);
+  for (const id of ['KDOX','KTLX','PAHG','PHKI','TJUA','PGUA']) assert.match(smoke, new RegExp(id));
+});
+
+test('final Pages artifact audit checks the current 17px timestamp and embeds the triggering Git SHA in the app bundle', () => {
+  assert.match(workflow, /#timeNow\{font-size:17px;font-weight:850/);
+  assert.match(workflow, /grep -R -Fq "\$GIT_SHA" dist\/assets/);
+});

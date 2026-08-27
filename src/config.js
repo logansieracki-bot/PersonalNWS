@@ -21,6 +21,5 @@ export const PRODUCT_LABELS = Object.freeze({
 });
 
 export const LEVEL2_ARCHIVE_BASE = 'https://unidata-nexrad-level2.s3.amazonaws.com';
-export const LEVEL2_CHUNKS_BASE = 'https://unidata-nexrad-level2-chunks.s3.amazonaws.com';
 export const ENGINE_API_VERSION = 4;
 export const PSWP_VERSION = 1;

@@ -118,3 +118,102 @@ test('frame pipeline emits fetch/decode/sweep diagnostics with exact source meta
   assert.ok(events.some(e=>e.code==='ARCHIVE_DECODE_OK'&&e.context.site==='KDIX'));
   assert.ok(events.some(e=>e.code==='SWEEP_READY'&&e.context.productId===1&&e.context.elevationNumber===1));
 });
+
+test('IndexedDB/cache operation failures degrade to uncached radar instead of killing a good frame', async () => {
+  const events=[];
+  const diagnostics={record(level,stage,code,message,context={}){events.push({level,stage,code,message,context});}};
+  const cache={
+    async getScan(){throw new Error('IndexedDB read failed')},
+    async getSweep(){throw new Error('IndexedDB sweep read failed')},
+    async putScan(){throw new Error('IndexedDB write failed')},
+    async putSweep(){throw new Error('IndexedDB sweep write failed')},
+  };
+  const engine={
+    ingest_archive(){return {site:'KDIX',elevations:[{number:1,angle:.5,products:[1]}]};},
+    build_sweep_blob(){return new Uint8Array(pswp());},
+    release_source(){},
+  };
+  const pipeline=new FramePipeline({cache,engine,diagnostics,fetchArrayBuffer:async()=>new Uint8Array(8).buffer});
+  const frame=await pipeline.load({site:'KDIX',objectKey:'obj',scanStartMs:1000,productId:1});
+  assert.equal(frame.productId,1);
+  assert.ok(events.some((event)=>event.stage==='cache'&&event.level==='warn'));
+});
+
+test('cache writes never block first Level II sweep delivery', async () => {
+  const never = new Promise(() => {});
+  const cache = {
+    async getScan(){}, async getSweep(){},
+    putScan(){ return never; },
+    putSweep(){ return never; },
+  };
+  const engine = {
+    ingest_archive(){ return { site:'KDIX', elevations:[{number:1,angle:.5,products:[1]}] }; },
+    build_sweep_blob(){ return new Uint8Array(pswp()); },
+    release_source(){},
+  };
+  const pipeline = new FramePipeline({ cache, engine, fetchArrayBuffer: async()=>new Uint8Array([1]).buffer });
+  const result = await Promise.race([
+    pipeline.load({ site:'KDIX', objectKey:'obj', scanStartMs:1000, productId:1 }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('first sweep was blocked by cache write')), 25)),
+  ]);
+  assert.equal(result.productId, 1);
+});
+
+test('current decoded source stays usable during a replacement download and is released only when replacement bytes arrive', async () => {
+  let resolveB;
+  const downloadB = new Promise((resolve) => { resolveB = resolve; });
+  const releases = [];
+  const cache = { async getScan(){}, async getSweep(){}, async putScan(){}, async putSweep(){} };
+  const engine = {
+    ingest_archive(_id, site){ return { site, elevations:[{ number:1, angle:.5, products:[1] }] }; },
+    build_sweep_blob(){ return new Uint8Array(pswp()); },
+    release_source(id){ releases.push(id); },
+  };
+  const pipeline = new FramePipeline({
+    cache,
+    engine,
+    fetchArrayBuffer: async (url) => url.includes('/B') ? downloadB : new Uint8Array([1]).buffer,
+  });
+
+  await pipeline.load({ site:'KDIX', objectKey:'A', scanStartMs:1000, productId:1 });
+  const replacement = pipeline.load({ site:'KDIX', objectKey:'B', scanStartMs:2000, productId:1 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(releases, []);
+
+  resolveB(new Uint8Array([2]).buffer);
+  await replacement;
+  assert.deepEqual(releases, ['KDIX|1000|A']);
+});
+
+test('an older archive download that finishes last cannot replace the active source chosen by a newer request', async () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const downloads = new Map([['A', deferred()], ['B', deferred()]]);
+  const ingests = [];
+  const releases = [];
+  const cache = { async getScan(){}, async getSweep(){}, async putScan(){}, async putSweep(){} };
+  const engine = {
+    ingest_archive(id, site){ ingests.push(id); return { site, elevations:[{number:1,angle:.5,products:[1]}] }; },
+    build_sweep_blob(){ return new Uint8Array(pswp()); },
+    release_source(id){ releases.push(id); },
+  };
+  const pipeline = new FramePipeline({
+    cache,
+    engine,
+    fetchArrayBuffer: async (url) => downloads.get(url.includes('/A') ? 'A' : 'B').promise,
+  });
+
+  const older = pipeline.load({ site:'KDIX', objectKey:'A', scanStartMs:1000, productId:1 });
+  const newer = pipeline.load({ site:'KDIX', objectKey:'B', scanStartMs:2000, productId:1 });
+
+  downloads.get('B').resolve(new Uint8Array([2]).buffer);
+  await newer;
+  downloads.get('A').resolve(new Uint8Array([1]).buffer);
+
+  await assert.rejects(older, (error) => error?.code === 'E_STALE_LOAD');
+  assert.deepEqual(ingests, ['KDIX|2000|B']);
+  assert.equal(releases.includes('KDIX|2000|B'), false);
+});

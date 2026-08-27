@@ -25,3 +25,41 @@ test('history decoder failure cannot fail priority startup', async () => {
   assert.equal(await startup.historyInit, null);
   assert.equal(startup.historyState.error, historyError);
 });
+
+test('map readiness rejects with a structured timeout instead of hanging forever', async () => {
+  const { waitForMapReady } = await import('../../src/radar/startup.js');
+  const listeners = new Map();
+  const map = {
+    loaded: () => false,
+    once(type, fn) { listeners.set(type, fn); },
+    off(type, fn) { if (listeners.get(type) === fn) listeners.delete(type); },
+  };
+  let timerFn = null;
+  const promise = waitForMapReady(map, {
+    timeoutMs: 2500,
+    setTimeoutImpl(fn, delay) { assert.equal(delay, 2500); timerFn = fn; return 91; },
+    clearTimeoutImpl() {},
+  });
+  assert.equal(typeof timerFn, 'function');
+  timerFn();
+  await assert.rejects(promise, (error) => error?.code === 'E_MAP_LOAD_TIMEOUT' && error?.stage === 'map');
+});
+
+test('map readiness resolves on load and cancels its timeout', async () => {
+  const { waitForMapReady } = await import('../../src/radar/startup.js');
+  const listeners = new Map();
+  let cleared = null;
+  const map = {
+    loaded: () => false,
+    once(type, fn) { listeners.set(type, fn); },
+    off(type, fn) { if (listeners.get(type) === fn) listeners.delete(type); },
+  };
+  const promise = waitForMapReady(map, {
+    timeoutMs: 2500,
+    setTimeoutImpl() { return 92; },
+    clearTimeoutImpl(id) { cleared = id; },
+  });
+  listeners.get('load')();
+  await promise;
+  assert.equal(cleared, 92);
+});

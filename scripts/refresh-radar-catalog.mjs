@@ -5,7 +5,7 @@ import {
   stationsFromNwsWfsResponse,
 } from '../src/radar/site-catalog.js';
 
-const response = await fetch(NWS_RADAR_SITES_WFS, { cache: 'no-store' });
+const response = await fetch(NWS_RADAR_SITES_WFS, { cache: 'no-store', signal: AbortSignal.timeout(20_000) });
 if (!response.ok) throw new Error(`NWS radar-sites WFS HTTP ${response.status}`);
 
 const payload = await response.json();

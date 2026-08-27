@@ -29,3 +29,27 @@ test('reads PSWP v1 zero-copy views',()=>{
 
 test('reads 16-bit gates',()=>{ assert.ok(readSweepBlob(fixture(2)).gates instanceof Uint16Array); });
 test('rejects truncation',()=>{ assert.throws(()=>readSweepBlob(fixture(1).slice(0,100)),/bounds|truncated/i); });
+
+function minimallyValidSweep({ radialCount = 1, gateCount = 1, firstGateKm = 0, gateIntervalKm = 0.25, maxRangeKm = 0.25, scale = 2, offset = 66 } = {}) {
+  const gateDataOffset = 120;
+  const buffer = new ArrayBuffer(gateDataOffset + Math.max(1, radialCount * gateCount));
+  const bytes = new Uint8Array(buffer); bytes.set([80,83,87,80], 0);
+  const d = new DataView(buffer);
+  d.setUint16(4,1,true); d.setUint16(6,96,true); d.setUint16(8,1,true); d.setUint8(10,1); d.setUint8(11,1);
+  d.setUint32(16,radialCount,true); d.setUint32(20,gateCount,true);
+  d.setFloat64(24,firstGateKm,true); d.setFloat64(32,gateIntervalKm,true); d.setFloat64(40,maxRangeKm,true);
+  d.setFloat32(48,scale,true); d.setFloat32(52,offset,true); d.setFloat32(56,0.5,true); d.setFloat32(60,0.5,true);
+  d.setUint32(80,96,true); d.setUint32(84,104,true); d.setUint32(88,112,true); d.setUint32(92,gateDataOffset,true);
+  return buffer;
+}
+
+test('rejects zero-sized sweep geometry before typed arrays or WebGL', () => {
+  assert.throws(() => readSweepBlob(minimallyValidSweep({ radialCount: 0 })), /radial count/i);
+  assert.throws(() => readSweepBlob(minimallyValidSweep({ gateCount: 0 })), /gate count/i);
+});
+
+test('rejects non-positive or non-finite sweep scaling/geometry', () => {
+  assert.throws(() => readSweepBlob(minimallyValidSweep({ gateIntervalKm: 0 })), /gate interval/i);
+  assert.throws(() => readSweepBlob(minimallyValidSweep({ scale: 0 })), /scale/i);
+  assert.throws(() => readSweepBlob(minimallyValidSweep({ maxRangeKm: Number.NaN })), /max range/i);
+});

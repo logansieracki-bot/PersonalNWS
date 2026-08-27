@@ -1,26 +1,11 @@
 import test from 'node:test'; import assert from 'node:assert/strict';
-import { normalizeStation, isActiveStation, parseStationDateMs } from '../../src/radar/site-catalog.js';
+import { normalizeStation } from '../../src/radar/site-catalog.js';
 import { archivePrefix, parseS3List } from '../../src/radar/nexrad-source.js';
 for (const id of ['KDOX','KTLX','PAHG','PHKI','TJUA','PGUA']) test(`normalizes ${id}`,()=>{ const s=normalizeStation({STATION_ID:id,STATION_NAME:id,LATITUDE:39,LONGITUDE:-76,BEGIN_DATE:0,END_DATE:null}); assert.equal(s.id,id); });
 test('normalizes NOAA namespaced NEXRAD station ids',()=>{ const s=normalizeStation({STATION_ID:'NEXRAD:KGGW',STATION_NAME:'Glasgow',LATITUDE:48.2,LONGITUDE:-106.6,BEGIN_DATE:19950101,END_DATE:99991231}); assert.equal(s.id,'KGGW'); });
 test('archive prefix is generic',()=>assert.equal(archivePrefix('KDOX',new Date('2026-08-23T00:00:00Z')),'2026/08/23/KDOX/'));
 test('S3 list parser keeps volume keys',()=>{const xml='<ListBucketResult><Contents><Key>2026/08/23/KDOX/KDOX20260823_010203_V06</Key></Contents><Contents><Key>2026/08/23/KDOX/MDM</Key></Contents></ListBucketResult>'; assert.deepEqual(parseS3List(xml).map(x=>x.key),['2026/08/23/KDOX/KDOX20260823_010203_V06']);});
 
-
-test('parses NCEI compact YYYYMMDD dates instead of treating them as epoch milliseconds',()=>{
-  assert.equal(parseStationDateMs(99991231), Date.UTC(9999,11,31,23,59,59,999));
-  assert.equal(parseStationDateMs('20260823'), Date.UTC(2026,7,23,23,59,59,999));
-});
-
-test('keeps a compact-date station active through its END_DATE day',()=>{
-  const station=normalizeStation({STATION_ID:'KDOX',STATION_NAME:'Dover',LATITUDE:38.8,LONGITUDE:-75.4,BEGIN_DATE:19920617,END_DATE:99991231});
-  assert.equal(isActiveStation(station, Date.UTC(2026,7,23,12)), true);
-});
-
-test('marks a compact-date station inactive after a real historical END_DATE',()=>{
-  const station=normalizeStation({STATION_ID:'ZZZZ',STATION_NAME:'Old',LATITUDE:35,LONGITUDE:-97,BEGIN_DATE:19900101,END_DATE:20200115});
-  assert.equal(isActiveStation(station, Date.UTC(2026,7,23)), false);
-});
 
 test('S3 volume entries expose scanStartMs for timeline/frame requests',()=>{
   const xml='<ListBucketResult><Contents><Key>2026/08/23/KDOX/KDOX20260823_220102_V06</Key></Contents></ListBucketResult>';
@@ -128,4 +113,67 @@ test('undersized bundled catalog falls through to NWS WFS instead of shipping on
   const sites = await loadRadarSites({ fetchImpl, fallbackUrl: 'tiny.json', minBundledSites: 2 });
   assert.deepEqual(sites.map((s) => s.id), ['KDIX', 'KDOX']);
   assert.equal(calls, 2);
+});
+
+test('catalog WFS timeout aborts, logs the real failure, and degrades to the bundled stations', async () => {
+  const { loadRadarSites } = await import('../../src/radar/site-catalog.js');
+  const events = [];
+  const diagnostics = { record(level, stage, code, message, context, error) { events.push({ level, stage, code, message, context, error }); } };
+  let remoteSignal = null;
+  let calls = 0;
+  const fetchImpl = async (_url, options = {}) => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: true, json: async () => [{ id: 'KDIX', name: 'Philadelphia', lat: 39.947, lon: -74.411 }] };
+    }
+    remoteSignal = options.signal;
+    return new Promise((_, reject) => {
+      options.signal?.addEventListener?.('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    });
+  };
+
+  const sites = await loadRadarSites({
+    fetchImpl,
+    fallbackUrl: 'tiny.json',
+    minBundledSites: 150,
+    timeoutMs: 10,
+    diagnostics,
+  });
+
+  assert.deepEqual(sites.map((s) => s.id), ['KDIX']);
+  assert.equal(remoteSignal?.aborted, true);
+  assert.ok(events.some((event) => event.code === 'CATALOG_REMOTE_TIMEOUT'));
+  assert.ok(events.some((event) => event.code === 'CATALOG_DEGRADED' && event.context.siteCount === 1));
+});
+
+test('browser radar source does not advertise unimplemented realtime Level II chunk APIs', async () => {
+  const source = await import('../../src/radar/nexrad-source.js');
+  const config = await import('../../src/config.js');
+  assert.equal(source.listRealtimeChunks, undefined);
+  assert.equal(source.chunkObjectUrl, undefined);
+  assert.equal(config.LEVEL2_CHUNKS_BASE, undefined);
+});
+
+test('completed-volume listing also times out while reading a stalled S3 XML body', async () => {
+  const { listCompletedVolumes } = await import('../../src/radar/nexrad-source.js');
+  const fetchImpl = async () => ({ ok: true, status: 200, text: () => new Promise(() => {}) });
+  await assert.rejects(
+    listCompletedVolumes('KDIX', Date.parse('2026-08-27T12:00:00Z'), Date.parse('2026-08-27T12:10:00Z'), { fetchImpl, timeoutMs: 10 }),
+    (error) => error?.code === 'E_S3_LIST_TIMEOUT' && error?.stage === 'listing',
+  );
+});
+
+test('one malformed bundled station is skipped instead of discarding every valid bundled radar', async () => {
+  const { loadRadarSites } = await import('../../src/radar/site-catalog.js');
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok:true, json: async () => [
+      { id:'KDIX', name:'Philadelphia', lat:39.947, lon:-74.411 },
+      { id:'BROKEN', name:'Bad', lat:'nope', lon:null },
+    ] };
+  };
+  const sites = await loadRadarSites({ fetchImpl, fallbackUrl:'local.json', minBundledSites:1 });
+  assert.deepEqual(sites.map((s) => s.id), ['KDIX']);
+  assert.equal(calls, 1, 'valid bundled stations should still avoid a remote dependency');
 });

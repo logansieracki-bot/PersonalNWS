@@ -5,6 +5,7 @@ use crate::source::DecodedSource;
 use std::collections::HashMap;
 
 const HEADER_SIZE: usize = 96;
+const MAX_SWEEP_BLOB_BYTES: usize = 128 * 1024 * 1024;
 const FLAG_COMPLETE: u32 = 1 << 0;
 const FLAG_LIVE_PARTIAL: u32 = 1 << 1;
 const FLAG_RADIAL_TIMES: u32 = 1 << 2;
@@ -12,7 +13,25 @@ const FLAG_RADIAL_ELEVATIONS: u32 = 1 << 3;
 const FLAG_SORTED_AZIMUTH: u32 = 1 << 4;
 const FLAG_ZERO_FILLED: u32 = 1 << 5;
 
-fn align8(n: usize) -> usize { (n + 7) & !7 }
+fn blob_size_error(source_id: &str, message: impl Into<String>) -> RadarError {
+    RadarError::new(RadarErrorCode::BlobBuild, "blob", source_id, message.into())
+}
+
+fn checked_mul(a: usize, b: usize, source_id: &str, label: &str) -> Result<usize, RadarError> {
+    a.checked_mul(b).ok_or_else(|| blob_size_error(source_id, format!("{label} overflow")))
+}
+
+fn checked_add(a: usize, b: usize, source_id: &str, label: &str) -> Result<usize, RadarError> {
+    a.checked_add(b).ok_or_else(|| blob_size_error(source_id, format!("{label} overflow")))
+}
+
+fn align8(n: usize, source_id: &str) -> Result<usize, RadarError> {
+    Ok(checked_add(n, 7, source_id, "alignment")? & !7)
+}
+
+fn checked_u32(value: usize, source_id: &str, label: &str) -> Result<u32, RadarError> {
+    u32::try_from(value).map_err(|_| blob_size_error(source_id, format!("{label} exceeds PSWP u32 range")))
+}
 fn put_u16(b: &mut [u8], o: usize, v: u16) { b[o..o+2].copy_from_slice(&v.to_le_bytes()); }
 fn put_u32(b: &mut [u8], o: usize, v: u32) { b[o..o+4].copy_from_slice(&v.to_le_bytes()); }
 fn put_f32(b: &mut [u8], o: usize, v: f32) { b[o..o+4].copy_from_slice(&v.to_le_bytes()); }
@@ -104,25 +123,65 @@ pub fn build_sweep_blob_core(source: &DecodedSource, elevation: u8, product: Pro
                 "first radial has no selected moment",
             )
         })?;
+    if !first_gate.is_finite()
+        || first_gate < 0.0
+        || !gate_interval.is_finite()
+        || gate_interval <= 0.0
+        || !scale.is_finite()
+        || scale == 0.0
+        || !offset.is_finite()
+    {
+        return Err(RadarError::new(
+            RadarErrorCode::GeometryMismatch,
+            "blob",
+            source_id,
+            "selected sweep has invalid moment geometry",
+        ));
+    }
     if word_bits != 8 && word_bits != 16 {
         return Err(RadarError::new(RadarErrorCode::BlobBuild, "blob", source_id, format!("unsupported data word size {word_bits}")));
     }
 
     let mut gate_count = 0usize;
     for radial in &target {
-        let (_, _, radial_gate_count, _, _, _) =
-            moment_params(product, radial).expect("target radials were filtered for dominant geometry");
+        let (_, _, radial_gate_count, _, _, _) = moment_params(product, radial).ok_or_else(|| {
+            RadarError::new(RadarErrorCode::GeometryMismatch, "blob", source_id, "selected radial lost its moment geometry")
+        })?;
         gate_count = gate_count.max(radial_gate_count);
+    }
+    if gate_count == 0 {
+        return Err(RadarError::new(
+            RadarErrorCode::GeometryMismatch,
+            "blob",
+            source_id,
+            "selected sweep has zero gates",
+        ));
     }
 
     let radial_count = target.len();
+    let radial_count_u32 = u32::try_from(radial_count)
+        .map_err(|_| blob_size_error(source_id, "radial count exceeds PSWP u32 range"))?;
+    let gate_count_u32 = u32::try_from(gate_count)
+        .map_err(|_| blob_size_error(source_id, "gate count exceeds PSWP u32 range"))?;
     let azimuth_offset = HEADER_SIZE;
-    let radial_time_offset = align8(azimuth_offset + radial_count * 4);
-    let radial_elevation_offset = radial_time_offset + radial_count * 8;
-    let gate_data_offset = align8(radial_elevation_offset + radial_count * 4);
+    let azimuth_bytes = checked_mul(radial_count, 4, source_id, "azimuth table size")?;
+    let radial_time_offset = align8(checked_add(azimuth_offset, azimuth_bytes, source_id, "azimuth table end")?, source_id)?;
+    let radial_time_bytes = checked_mul(radial_count, 8, source_id, "radial time table size")?;
+    let radial_elevation_offset = checked_add(radial_time_offset, radial_time_bytes, source_id, "radial time table end")?;
+    let radial_elevation_bytes = checked_mul(radial_count, 4, source_id, "radial elevation table size")?;
+    let gate_data_offset = align8(checked_add(radial_elevation_offset, radial_elevation_bytes, source_id, "radial elevation table end")?, source_id)?;
     let bytes_per_gate = if word_bits == 16 { 2 } else { 1 };
-    let gate_bytes = radial_count.checked_mul(gate_count).and_then(|v| v.checked_mul(bytes_per_gate)).ok_or_else(|| RadarError::new(RadarErrorCode::BlobBuild, "blob", source_id, "sweep size overflow"))?;
-    let total = gate_data_offset + gate_bytes;
+    let gate_cells = checked_mul(radial_count, gate_count, source_id, "gate cell count")?;
+    let gate_bytes = checked_mul(gate_cells, bytes_per_gate, source_id, "gate data size")?;
+    let total = checked_add(gate_data_offset, gate_bytes, source_id, "total sweep size")?;
+    if total > MAX_SWEEP_BLOB_BYTES {
+        return Err(blob_size_error(source_id, format!("sweep blob is too large ({total} bytes)")));
+    }
+    let azimuth_offset_u32 = checked_u32(azimuth_offset, source_id, "azimuth offset")?;
+    let radial_time_offset_u32 = checked_u32(radial_time_offset, source_id, "radial time offset")?;
+    let radial_elevation_offset_u32 = checked_u32(radial_elevation_offset, source_id, "radial elevation offset")?;
+    let gate_data_offset_u32 = u32::try_from(gate_data_offset)
+        .map_err(|_| blob_size_error(source_id, "gate data offset exceeds PSWP u32 range"))?;
     let mut out = vec![0u8; total];
 
     out[0..4].copy_from_slice(b"PSWP");
@@ -134,8 +193,8 @@ pub fn build_sweep_blob_core(source: &DecodedSource, elevation: u8, product: Pro
     let mut flags = FLAG_RADIAL_TIMES | FLAG_RADIAL_ELEVATIONS | FLAG_SORTED_AZIMUTH | FLAG_ZERO_FILLED;
     if source.complete { flags |= FLAG_COMPLETE; } else { flags |= FLAG_LIVE_PARTIAL; }
     put_u32(&mut out, 12, flags);
-    put_u32(&mut out, 16, radial_count as u32);
-    put_u32(&mut out, 20, gate_count as u32);
+    put_u32(&mut out, 16, radial_count_u32);
+    put_u32(&mut out, 20, gate_count_u32);
     put_f64(&mut out, 24, first_gate);
     put_f64(&mut out, 32, gate_interval);
     put_f64(&mut out, 40, first_gate + gate_count as f64 * gate_interval);
@@ -155,8 +214,9 @@ pub fn build_sweep_blob_core(source: &DecodedSource, elevation: u8, product: Pro
         elev_sum += elev as f64;
         start = start.min(ts); end = end.max(ts);
 
-        let raw = moment_raw_values(product, radial)
-            .expect("target radials were filtered for product availability");
+        let raw = moment_raw_values(product, radial).ok_or_else(|| {
+            RadarError::new(RadarErrorCode::ProductNotAvailable, "blob", source_id, "selected radial has no raw moment values")
+        })?;
         if word_bits == 16 {
             let n = (raw.len()/2).min(gate_count);
             for i in 0..n {
@@ -175,10 +235,10 @@ pub fn build_sweep_blob_core(source: &DecodedSource, elevation: u8, product: Pro
     put_f32(&mut out, 60, nominal);
     put_f64(&mut out, 64, start);
     put_f64(&mut out, 72, end);
-    put_u32(&mut out, 80, azimuth_offset as u32);
-    put_u32(&mut out, 84, radial_time_offset as u32);
-    put_u32(&mut out, 88, radial_elevation_offset as u32);
-    put_u32(&mut out, 92, gate_data_offset as u32);
+    put_u32(&mut out, 80, azimuth_offset_u32);
+    put_u32(&mut out, 84, radial_time_offset_u32);
+    put_u32(&mut out, 88, radial_elevation_offset_u32);
+    put_u32(&mut out, 92, gate_data_offset_u32);
     Ok(out)
 }
 

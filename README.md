@@ -68,7 +68,7 @@ The bottom-center frame time is intentionally emphasized and marks the newest fr
 
 ## Full WSR-88D catalog
 
-The Alpha radar engine is not built around a small test list. The checked-in station catalog is refreshed from official NOAA/NWS sources and the deployment workflow refuses to publish a catalog with fewer than **150** current WSR-88D sites.
+The Alpha radar engine is not built around a small test list. The source checkout carries a small emergency fallback catalog, but both runtime startup and GitHub Actions refresh from the official NWS radar-sites WFS whenever that fallback is undersized. The deployment workflow refuses to publish a built catalog with fewer than **150** current WSR-88D sites.
 
 The runtime understands four-character site IDs generically; KDIX, KDOX, KTLX, PAHG, PHKI, TJUA, PGUA, and every other supported WSR-88D use the same code path. Namespaced IDs such as `NEXRAD:KGGW` are normalized to the Level II station ID.
 
@@ -93,7 +93,7 @@ Important stages include:
 
 ```text
 boot → catalog → selection → fast-radar → listing → network
-     → wasm → decode → sweep → cache → renderer → history → live
+     → wasm → decode → sweep → cache → render → history → live
 ```
 
 Worker diagnostics are forwarded into the same browser log so the trail can show exactly where a load stopped, for example:
@@ -143,7 +143,7 @@ The intended test/deploy workflow remains simple:
 2. Commit to `main`.
 3. Push with GitHub Desktop.
 4. GitHub Actions builds and verifies the release.
-5. GitHub Pages deploys only if all release gates pass.
+5. GitHub Pages deploys after all blocking build/decoder/catalog gates pass. The live-browser radar smoke is diagnostic during Alpha so a flaky external-service check cannot strand Pages on an older build.
 
 Repository **Settings → Pages → Source** should be **GitHub Actions**.
 
@@ -158,7 +158,30 @@ The deployment workflow verifies:
 - A genuinely current Level II volume through native Rust decode.
 - A production-browser smoke test that proves prepared NWS radar becomes visible first and then forces the real Level II/WASM/WebGL path.
 
-A failed radar engine gate blocks deployment instead of publishing a knowingly broken Pages build.
+Rust compilation/tests, WASM compilation, JS regressions, catalog-size validation, production build checks, decoder-artifact checks, and the native current-Level-II smoke are blocking gates. The real-browser radar smoke is intentionally non-blocking during Alpha; its Playwright diagnostics are uploaded when it fails so the newest instrumented Alpha can still be tested on Pages.
+
+## Full-audit hardening
+
+The Alpha codebase has been audited across the actual production entrypoint, radar controller, prepared-radar renderer, Level II worker/session lifecycle, cache, S3 discovery/download path, Rust archive/blob handling, WebGL renderer, station catalog, browser smoke test, and Pages workflow. Important hardening from that audit includes:
+
+- Decoder glue and WASM URLs include the exact Git build SHA, preventing a new app bundle from silently reusing an older decoder.
+- Worker crashes and timeouts permanently invalidate dead clients; retries create genuinely fresh decoder workers.
+- The history worker can restart independently without taking down the priority decoder.
+- Level II requests are generation-guarded so older downloads/results cannot overwrite a newer requested frame.
+- The current decoded Rust source remains usable while replacement bytes download, and stale sources are released at the actual source-swap boundary.
+- IndexedDB is optional: open/read/write failures degrade to memory/uncached operation instead of blocking radar.
+- Cache writes are off the first-sweep critical path.
+- S3 listing, archive fetch/body reads, catalog fetches, map startup, worker requests, and CI smoke discovery/downloads have bounded deadlines.
+- Rust PSWP serialization uses checked geometry/layout arithmetic and avoids production panic-style `unwrap()`/`expect()` paths.
+- WebGL setup, shader compilation, program linking, texture upload, and draw failures use structured diagnostic codes.
+- Real user actions go through the diagnostic action boundary; the browser smoke test clicks an actual MapLibre radar marker rather than calling a hidden selection API.
+- The duplicate worker-side site-selection/listing controller and deprecated ArcGIS catalog implementation were removed, leaving one production frame-selection path and one current station-catalog service.
+
+The bottom current-frame timestamp is `17px` / `850` weight: intentionally stronger, but still inside the original timeline layout.
+
+### Build reproducibility limitation
+
+The repository still does not contain `package-lock.json` or `decoder/Cargo.lock`. Direct JavaScript dependencies and the NEXRAD Rust crates are version-pinned, but transitive dependency resolution is not fully frozen until those lockfiles are generated and committed from an environment with package-registry access. This repair environment cannot reliably reach npm and does not provide Cargo, so lockfiles are deliberately not fabricated.
 
 ## Data sources and cost
 

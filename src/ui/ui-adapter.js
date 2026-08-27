@@ -1,5 +1,5 @@
 import { PRODUCT_LABELS } from '../config.js';
-import { showDiagnostic } from '../diagnostics.js';
+import { clearDiagnostic, showDiagnostic } from '../diagnostics.js';
 
 export function decorateFrameTime(label, { live = false, syncing = false } = {}) {
   if (live && syncing) return 'LIVE · syncing…';
@@ -8,10 +8,13 @@ export function decorateFrameTime(label, { live = false, syncing = false } = {})
 
 export function createUI(doc=document){
   const $=id=>doc.getElementById(id);
+  const clearError=()=>{$('dot')?.classList.remove('bad');clearDiagnostic();};
   return {
+    clearError,
     busy(on){$('dot')?.classList.toggle('live',!on);if(on&&$('detail')){$('detail').textContent='loading radar…';}},
     site(site){if($('site'))$('site').textContent=`${site.id} · ${site.name}`;},
     preparedRadar(productId){
+      clearError();
       const tilt=$('tilt');
       if(tilt){
         tilt.innerHTML='';
@@ -25,6 +28,7 @@ export function createUI(doc=document){
       $('dot')?.classList.add('live');
     },
     manifest(manifest,elevationNumber,productId){
+      clearError();
       const tilt=$('tilt');
       if(tilt){
         tilt.innerHTML='';

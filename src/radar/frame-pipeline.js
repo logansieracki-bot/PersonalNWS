@@ -34,10 +34,24 @@ export class FramePipeline {
     this.diagnostics = diagnostics;
     this.now = now;
     this.active = null;
+    this.loadGeneration = 0;
   }
 
   #log(level, stage, code, message, context = {}, error = null) {
     try { this.diagnostics?.record?.(level, stage, code, message, context, error); } catch {}
+  }
+
+
+  async #cache(method, args, fallback = undefined) {
+    try {
+      return await this.cache?.[method]?.(...args);
+    } catch (error) {
+      const write = method.startsWith('put');
+      this.#log('warn', 'cache', write ? 'CACHE_WRITE_FAILED' : 'CACHE_READ_FAILED', `${method} failed; continuing without persistent cache`, {
+        method, site: args?.[0] ?? '', scanStartMs: args?.[1] ?? null,
+      }, error);
+      return fallback;
+    }
   }
 
   #releaseActive() {
@@ -51,15 +65,34 @@ export class FramePipeline {
     this.active = null;
   }
 
-  dispose() { this.#releaseActive(); }
+  dispose() {
+    this.loadGeneration += 1;
+    this.#releaseActive();
+  }
+
+  #assertCurrent(generation, { site, objectKey, scanStartMs }) {
+    if (generation === this.loadGeneration) return;
+    const error = Object.assign(new Error(`Obsolete Level II load was superseded for ${site}`), {
+      code: 'E_STALE_LOAD',
+      stage: 'pipeline',
+      sourceId: objectKey,
+      context: { site, objectKey, scanStartMs, generation, currentGeneration: this.loadGeneration },
+    });
+    this.#log('debug', 'pipeline', 'STALE_LOAD_IGNORED', error.message, error.context);
+    throw error;
+  }
 
   async load({ site, objectKey, scanStartMs, elevationNumber = null, productId = 1 }) {
+    const generation = ++this.loadGeneration;
+    const identity = { site, objectKey, scanStartMs };
     const loadStarted = this.now();
-    let manifest = await this.cache.getScan(site, scanStartMs);
+    let manifest = await this.#cache('getScan', [site, scanStartMs]);
+    this.#assertCurrent(generation, identity);
     if (manifest) {
       const elevation = chooseElevation(manifest, elevationNumber, productId);
       if (elevation) {
-        const cached = await this.cache.getSweep(site, scanStartMs, elevation.number, productId);
+        const cached = await this.#cache('getSweep', [site, scanStartMs, elevation.number, productId]);
+        this.#assertCurrent(generation, identity);
         if (cached) {
           this.#log('info', 'cache', 'SWEEP_CACHE_HIT', `Using cached sweep for ${site}`, {
             site, objectKey, scanStartMs, productId, elevationNumber: elevation.number,
@@ -81,13 +114,13 @@ export class FramePipeline {
       manifest = this.active.manifest;
       this.#log('debug', 'wasm', 'SOURCE_REUSE', `Reusing decoded Level II source for ${site}`, { site, objectKey, scanStartMs, sourceId });
     } else {
-      this.#releaseActive();
       const url = archiveObjectUrl(objectKey);
       const fetchStarted = this.now();
       this.#log('info', 'fetch', 'ARCHIVE_FETCH_START', `Fetching Level II archive for ${site}`, { site, objectKey, scanStartMs, sourceId: url });
       let bytes;
       try {
         bytes = await this.fetchArrayBuffer(url);
+        this.#assertCurrent(generation, identity);
       } catch (error) {
         this.#log('error', error?.stage ?? 'fetch', error?.code ?? 'ARCHIVE_FETCH_FAILED', `Level II archive fetch failed for ${site}`, {
           site, objectKey, scanStartMs, sourceId: url, elapsedMs: this.now() - fetchStarted,
@@ -98,6 +131,10 @@ export class FramePipeline {
       this.#log('info', 'fetch', 'ARCHIVE_FETCH_OK', `Fetched Level II archive for ${site}`, {
         site, objectKey, scanStartMs, sourceId: url, byteLength, elapsedMs: this.now() - fetchStarted,
       });
+      // Keep the currently decoded volume usable while the network request is in flight.
+      // Swap sources only once the replacement bytes are actually available. This also
+      // releases a source that may have become active while this request was downloading.
+      this.#releaseActive();
       sourceId = `${site}|${scanStartMs}|${objectKey}`;
       const decodeStarted = this.now();
       this.#log('info', 'archive', 'ARCHIVE_DECODE_START', `Decoding Level II archive for ${site}`, { site, objectKey, scanStartMs, sourceId, byteLength });
@@ -105,7 +142,7 @@ export class FramePipeline {
         manifest = this.engine.ingest_archive(sourceId, site, new Uint8Array(bytes));
         if (!manifest?.elevations?.length) throw new Error(`decoded ${site} volume has no elevations`);
         this.active = { sourceId, site, objectKey, scanStartMs, manifest };
-        await this.cache.putScan(site, scanStartMs, manifest);
+        void this.#cache('putScan', [site, scanStartMs, manifest]);
         this.#log('info', 'archive', 'ARCHIVE_DECODE_OK', `Decoded Level II archive for ${site}`, {
           site, objectKey, scanStartMs, sourceId, byteLength,
           elevationCount: manifest.elevations.length, vcp: manifest.vcp ?? null,
@@ -130,7 +167,7 @@ export class FramePipeline {
       });
       const blobView = this.engine.build_sweep_blob(sourceId, elevation.number, productId);
       const buffer = ownArrayBuffer(blobView);
-      await this.cache.putSweep(site, scanStartMs, elevation.number, productId, buffer);
+      void this.#cache('putSweep', [site, scanStartMs, elevation.number, productId, buffer]);
       this.#log('info', 'sweep', 'SWEEP_READY', `Sweep ready for ${site}`, {
         site, objectKey, scanStartMs, productId, elevationNumber: elevation.number,
         sourceId, byteLength: buffer.byteLength, elapsedMs: this.now() - sweepStarted,

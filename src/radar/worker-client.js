@@ -9,6 +9,7 @@ export class WorkerClient {
     this.now = now;
     this.pending = new Map();
     this.listeners = new Map();
+    this.terminalError = null;
     worker.addEventListener('message', (e) => this.#on(e.data));
     worker.addEventListener('error', (e) => this.#failAll(e.error ?? new Error(e.message || 'worker error')));
     worker.addEventListener?.('messageerror', (e) => this.#failAll(new Error(e?.message || 'worker message error')));
@@ -26,6 +27,7 @@ export class WorkerClient {
   }
 
   request(type, payload = {}, transfer = []) {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const msg = validateCommand({ id: crypto.randomUUID(), type, payload });
     const started = this.now();
     this.#log('debug', 'worker', 'WORKER_REQUEST', `${this.role} worker ${type}`, { role: this.role, command: type, requestId: msg.id });
@@ -52,6 +54,7 @@ export class WorkerClient {
   }
 
   post(type, payload = {}, transfer = []) {
+    if (this.terminalError) throw this.terminalError;
     const msg = validateCommand({ type, payload });
     this.worker.postMessage(msg, transfer);
   }
@@ -76,14 +79,26 @@ export class WorkerClient {
   }
 
   #failAll(err) {
-    this.#log('error', 'worker', err?.code ?? 'E_WORKER', `${this.role} worker crashed`, { role: this.role, pendingCount: this.pending.size }, err);
+    const failure = err?.code === 'E_WORKER' && err?.stage === 'worker'
+      ? err
+      : Object.assign(new Error(String(err?.message || err || `${this.role} worker crashed`)), {
+          code: 'E_WORKER',
+          stage: 'worker',
+          sourceId: this.role,
+          detail: String(err?.stack || err?.message || err || 'worker crashed'),
+          context: { role: this.role },
+          cause: err,
+        });
+    if (!this.terminalError) this.terminalError = failure;
+    const terminal = this.terminalError;
+    this.#log('error', 'worker', 'E_WORKER', `${this.role} worker crashed`, { role: this.role, pendingCount: this.pending.size }, terminal);
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
-      p.reject(err);
+      p.reject(terminal);
     }
     this.pending.clear();
     for (const fn of this.listeners.get(EVENTS.DIAGNOSTIC) ?? []) {
-      fn({ code: 'E_WORKER', stage: 'worker', message: String(err?.message || err), detail: String(err?.stack || err), context: { role: this.role } });
+      fn({ code: terminal.code, stage: terminal.stage, sourceId: terminal.sourceId, message: terminal.message, detail: terminal.detail, context: terminal.context });
     }
   }
 }

@@ -23,6 +23,30 @@ export function newestVolumeKey(keys) {
   return [...keys].sort().at(-1) ?? null;
 }
 
+
+async function fetchTextWithTimeout(fetchImpl, url, timeoutMs) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { controller?.abort(); } catch { /* best effort */ }
+      reject(Object.assign(new Error(`smoke listing timed out after ${timeoutMs} ms`), {
+        code: 'E_SMOKE_TIMEOUT', sourceId: String(url),
+      }));
+    }, timeoutMs);
+  });
+  try {
+    const response = await Promise.race([
+      Promise.resolve(fetchImpl(url, { cache: 'no-store', ...(controller ? { signal: controller.signal } : {}) })),
+      timeout,
+    ]);
+    if (!response?.ok) return null;
+    return await Promise.race([Promise.resolve(response.text()), timeout]);
+  } finally {
+    if (timer != null) clearTimeout(timer);
+  }
+}
+
 export async function findCurrentVolume({
   sites,
   now = new Date(),
@@ -30,6 +54,7 @@ export async function findCurrentVolume({
   archiveBase = 'https://unidata-nexrad-level2.s3.amazonaws.com',
   fetchImpl = fetch,
   maxAgeMs = 2 * 60 * 60 * 1000,
+  requestTimeoutMs = 8_000,
 }) {
   for (let dayOffset = 0; dayOffset <= lookbackDays; dayOffset += 1) {
     const day = new Date(now.getTime() - dayOffset * 86400000);
@@ -38,9 +63,14 @@ export async function findCurrentVolume({
       const url = new URL(`${archiveBase}/`);
       url.searchParams.set('list-type', '2');
       url.searchParams.set('prefix', prefix);
-      const response = await fetchImpl(url);
-      if (!response.ok) continue;
-      const keys = parseVolumeKeys(await response.text());
+      let xml;
+      try {
+        xml = await fetchTextWithTimeout(fetchImpl, url, requestTimeoutMs);
+      } catch {
+        continue;
+      }
+      if (xml == null) continue;
+      const keys = parseVolumeKeys(xml);
       const fresh = keys.filter((key) => {
         const t = volumeKeyTimeMs(key);
         return Number.isFinite(t) && t <= now.getTime() && now.getTime() - t <= maxAgeMs;

@@ -1,44 +1,11 @@
 import { WSR88D_ID_SET } from './wsr88d-ids.js';
 
-export const NOAA_NEXRAD_QUERY =
-  'https://gis.ncdc.noaa.gov/arcgis/rest/services/cdo/nexrad/MapServer/0/query?where=1%3D1&outFields=STATION_ID%2CSTATION_NAME%2CSTATE%2CCOUNTRY%2CLATITUDE%2CLONGITUDE%2CBEGIN_DATE%2CEND_DATE&returnGeometry=false&f=json';
-
 export const NWS_RADAR_SITES_WFS =
   'https://opengeo.ncep.noaa.gov/geoserver/nws/ows?request=GetFeature&service=WFS&typeName=nws%3Aradar_sites&version=1.0.0&outputFormat=application%2Fjson';
 
 export const MIN_EXPECTED_WSR88D_SITES = 150;
 
 const ID = /^[A-Z0-9]{4}$/;
-const COMPACT_DATE = /^(\d{4})(\d{2})(\d{2})$/;
-
-export function parseStationDateMs(value) {
-  if (value == null || value === '') return Number.NaN;
-
-  const compact = String(value).trim().match(COMPACT_DATE);
-  if (compact) {
-    const year = Number(compact[1]);
-    const month = Number(compact[2]);
-    const day = Number(compact[3]);
-    if (month < 1 || month > 12 || day < 1 || day > 31) return Number.NaN;
-    const ms = Date.UTC(year, month - 1, day, 23, 59, 59, 999);
-    const check = new Date(ms);
-    if (
-      check.getUTCFullYear() !== year ||
-      check.getUTCMonth() !== month - 1 ||
-      check.getUTCDate() !== day
-    ) return Number.NaN;
-    return ms;
-  }
-
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    if (Math.abs(value) >= 100_000_000_000) return value;
-    if (Math.abs(value) >= 1_000_000_000) return value * 1000;
-  }
-
-  const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) ? parsed : Number.NaN;
-}
-
 export function normalizeStation(a) {
   const rawId = String(a.STATION_ID ?? a.rda_id ?? a.id ?? '').trim().toUpperCase();
   const id = rawId.startsWith('NEXRAD:') ? rawId.slice('NEXRAD:'.length) : rawId;
@@ -63,25 +30,6 @@ export function normalizeStation(a) {
   };
 }
 
-export function isActiveStation(station, now = Date.now()) {
-  if (station.endDate == null || station.endDate === '') return true;
-  const end = parseStationDateMs(station.endDate);
-  return !Number.isFinite(end) || end >= now;
-}
-
-export function stationsFromArcGisResponse(payload, now = Date.now()) {
-  if (payload?.error) {
-    const code = payload.error.code ?? 'unknown';
-    const message = payload.error.message ?? 'ArcGIS query failed';
-    throw new Error(`NOAA catalog ArcGIS error ${code}: ${message}`);
-  }
-  if (!Array.isArray(payload?.features)) throw new Error('NOAA catalog response did not contain a features array');
-  return payload.features
-    .map((feature) => normalizeStation(feature.attributes ?? feature))
-    .filter((station) => isActiveStation(station, now))
-    .sort((a, b) => a.id.localeCompare(b.id));
-}
-
 export function stationsFromNwsWfsResponse(payload, allowedIds = WSR88D_ID_SET) {
   if (!Array.isArray(payload?.features)) throw new Error('NWS radar-sites WFS response did not contain a features array');
   const byId = new Map();
@@ -99,23 +47,101 @@ export function stationsFromNwsWfsResponse(payload, allowedIds = WSR88D_ID_SET) 
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function catalogError(message, code, sourceId, cause = null) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = code;
+  error.stage = 'catalog';
+  error.sourceId = String(sourceId ?? '');
+  return error;
+}
+
+async function fetchJsonWithTimeout(url, { fetchImpl, timeoutMs }) {
+  const controller = new AbortController();
+  let timer = null;
+  let timedOut = false;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(catalogError(`Radar catalog request timed out after ${timeoutMs} ms`, 'E_CATALOG_TIMEOUT', url));
+    }, timeoutMs);
+  });
+  try {
+    const response = await Promise.race([
+      Promise.resolve(fetchImpl(url, { cache: 'no-store', signal: controller.signal })),
+      timeout,
+    ]);
+    if (!response?.ok && response?.ok !== undefined) {
+      throw catalogError(`Radar catalog HTTP ${response.status}`, 'E_CATALOG_HTTP', url);
+    }
+    return await Promise.race([
+      Promise.resolve(response.json()),
+      timeout,
+    ]);
+  } catch (error) {
+    if (timedOut || error?.code === 'E_CATALOG_TIMEOUT') {
+      throw catalogError(`Radar catalog request timed out after ${timeoutMs} ms`, 'E_CATALOG_TIMEOUT', url, error);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function loadRadarSites({
   fetchImpl = fetch,
   fallbackUrl = new URL('../data/nexrad-sites.json', import.meta.url),
   minBundledSites = MIN_EXPECTED_WSR88D_SITES,
+  timeoutMs = 5_000,
+  diagnostics = null,
 } = {}) {
-  try {
-    const response = await fetchImpl(fallbackUrl, { cache: 'no-store' });
-    const fallback = (await response.json())
-      .map(normalizeStation)
-      .filter((station) => WSR88D_ID_SET.has(station.id))
-      .sort((a, b) => a.id.localeCompare(b.id));
-    if (fallback.length >= minBundledSites) return fallback;
-  } catch {}
+  let fallback = [];
+  const log = (level, code, message, context = {}, error = null) => {
+    try { diagnostics?.record?.(level, 'catalog', code, message, context, error); } catch {}
+  };
 
-  const response = await fetchImpl(NWS_RADAR_SITES_WFS, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`NWS radar-sites WFS HTTP ${response.status}`);
-  const sites = stationsFromNwsWfsResponse(await response.json());
-  if (!sites.length) throw new Error('NWS radar-sites WFS returned no current WSR-88D sites');
-  return sites;
+  try {
+    const payload = await fetchJsonWithTimeout(fallbackUrl, { fetchImpl, timeoutMs });
+    const bundledEntries = Array.isArray(payload) ? payload : [];
+    let skippedBundled = 0;
+    fallback = [];
+    for (const entry of bundledEntries) {
+      try {
+        const station = normalizeStation(entry);
+        if (WSR88D_ID_SET.has(station.id)) fallback.push(station);
+      } catch {
+        skippedBundled += 1;
+      }
+    }
+    fallback.sort((a, b) => a.id.localeCompare(b.id));
+    if (skippedBundled) {
+      log('warn', 'CATALOG_BUNDLED_MALFORMED', `Skipped ${skippedBundled} malformed bundled radar site${skippedBundled === 1 ? '' : 's'}`, {
+        skippedSiteCount: skippedBundled,
+        acceptedSiteCount: fallback.length,
+      });
+    }
+    if (fallback.length >= minBundledSites) {
+      log('info', 'CATALOG_BUNDLED_READY', `Loaded ${fallback.length} bundled WSR-88D sites`, { siteCount: fallback.length });
+      return fallback;
+    }
+    log('warn', 'CATALOG_BUNDLED_SMALL', `Bundled radar catalog has only ${fallback.length} sites; refreshing from NWS`, { siteCount: fallback.length, expectedMinimum: minBundledSites });
+  } catch (error) {
+    log('warn', 'CATALOG_BUNDLED_FAILED', 'Bundled radar catalog could not be loaded; refreshing from NWS', { sourceId: String(fallbackUrl) }, error);
+  }
+
+  try {
+    const payload = await fetchJsonWithTimeout(NWS_RADAR_SITES_WFS, { fetchImpl, timeoutMs });
+    const sites = stationsFromNwsWfsResponse(payload);
+    if (!sites.length) throw catalogError('NWS radar-sites WFS returned no current WSR-88D sites', 'E_CATALOG_EMPTY', NWS_RADAR_SITES_WFS);
+    log('info', 'CATALOG_REMOTE_READY', `Loaded ${sites.length} current WSR-88D sites from NWS`, { siteCount: sites.length });
+    return sites;
+  } catch (error) {
+    const code = error?.code === 'E_CATALOG_TIMEOUT' ? 'CATALOG_REMOTE_TIMEOUT' : 'CATALOG_REMOTE_FAILED';
+    log('error', code, error?.message ?? 'NWS radar catalog refresh failed', { sourceId: NWS_RADAR_SITES_WFS }, error);
+    if (fallback.length) {
+      log('warn', 'CATALOG_DEGRADED', `Using ${fallback.length} bundled radar sites because the live NWS catalog is unavailable`, { siteCount: fallback.length, expectedMinimum: minBundledSites }, error);
+      return fallback;
+    }
+    throw error;
+  }
 }

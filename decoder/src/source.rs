@@ -44,9 +44,17 @@ impl DecodedSource {
             scan_start = scan_start.min(start);
             scan_end = scan_end.max(end);
             let mut products = Vec::new();
-            for id in 1u16..=6u16 {
-                let p = ProductId::try_from(id).unwrap();
-                if radials.iter().any(|r| Self::product_available(p, r)) { products.push(id); }
+            for product in [
+                ProductId::Reflectivity,
+                ProductId::Velocity,
+                ProductId::SpectrumWidth,
+                ProductId::DifferentialReflectivity,
+                ProductId::CorrelationCoefficient,
+                ProductId::DifferentialPhase,
+            ] {
+                if radials.iter().any(|r| Self::product_available(product, r)) {
+                    products.push(product as u16);
+                }
             }
             elevations.push(ElevationManifestV1 {
                 number,

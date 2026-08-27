@@ -36,3 +36,27 @@ test('timed out archive fetch is actively aborted so a fallback scan is not band
   assert.ok(signal, 'fetch should receive an AbortSignal');
   assert.equal(signal.aborted, true);
 });
+
+test('archive timeout is retried when retry budget remains', async () => {
+  let attempts = 0;
+  const fetchImpl = (_url, { signal } = {}) => {
+    attempts++;
+    if (attempts === 1) return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }));
+    return Promise.resolve({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([9]).buffer });
+  };
+  const result = await fetchArrayBufferWithRetry('https://example.test/radar', { fetchImpl, retries: 1, timeoutMs: 5, retryDelayMs: 0 });
+  assert.equal(attempts, 2);
+  assert.equal(result.byteLength, 1);
+});
+
+test('a real timeout itself is retried, not only an AbortError side effect', async () => {
+  let attempts = 0;
+  const fetchImpl = () => {
+    attempts++;
+    if (attempts === 1) return new Promise(() => {}); // ignores AbortSignal; timeout promise must drive retry
+    return Promise.resolve({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([7, 8]).buffer });
+  };
+  const result = await fetchArrayBufferWithRetry('https://example.test/radar', { fetchImpl, retries: 1, timeoutMs: 5, retryDelayMs: 0 });
+  assert.equal(attempts, 2);
+  assert.equal(result.byteLength, 2);
+});

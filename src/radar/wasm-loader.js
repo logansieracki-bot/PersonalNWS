@@ -1,15 +1,16 @@
-import { APP_VERSION } from '../config.js';
+import { APP_VERSION, BUILD_ID } from '../config.js';
 
 export function resolveDecoderBase(base = document.baseURI) {
   return new URL('decoder/', base).href;
 }
 
-export function decoderAssetUrls(decoderBase = resolveDecoderBase(), version = APP_VERSION) {
+export function decoderAssetUrls(decoderBase = resolveDecoderBase(), version = APP_VERSION, buildId = BUILD_ID) {
   const js = new URL('personalnws_decoder.js', decoderBase);
   const wasm = new URL('personalnws_decoder_bg.wasm', decoderBase);
-  if (version) {
-    js.searchParams.set('v', version);
-    wasm.searchParams.set('v', version);
+  const cacheToken = [version, buildId].filter(Boolean).join('-');
+  if (cacheToken) {
+    js.searchParams.set('v', cacheToken);
+    wasm.searchParams.set('v', cacheToken);
   }
   return { jsUrl: js.href, wasmUrl: wasm.href };
 }
@@ -27,10 +28,27 @@ export async function initRadarWasm(mod, wasmUrl) {
   }
 }
 
-export async function loadRadarDecoder(decoderBase = resolveDecoderBase()) {
+export async function loadRadarDecoder(decoderBase = resolveDecoderBase(), {
+  importModule = (url) => import(/* @vite-ignore */ url),
+} = {}) {
   const { jsUrl, wasmUrl } = decoderAssetUrls(decoderBase);
-  const mod = await import(/* @vite-ignore */ jsUrl);
-  await initRadarWasm(mod, wasmUrl);
+  let mod;
+  try {
+    mod = await importModule(jsUrl);
+  } catch (cause) {
+    throw Object.assign(new Error(`decoder glue module could not be loaded: ${cause?.message ?? cause}`), {
+      code: 'E_WASM_IMPORT', stage: 'wasm', sourceId: jsUrl, cause,
+      detail: String(cause?.stack ?? cause?.message ?? cause),
+    });
+  }
+  try {
+    await initRadarWasm(mod, wasmUrl);
+  } catch (cause) {
+    throw Object.assign(new Error(`decoder WASM could not initialize: ${cause?.message ?? cause}`), {
+      code: 'E_WASM_INIT', stage: 'wasm', sourceId: wasmUrl, cause,
+      detail: String(cause?.stack ?? cause?.message ?? cause),
+    });
+  }
   if (typeof mod.RadarEngine !== 'function') {
     throw Object.assign(new Error('decoder WASM loaded but RadarEngine export is missing'), {
       code: 'E_WASM_EXPORT', stage: 'wasm', sourceId: jsUrl,

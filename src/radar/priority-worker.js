@@ -1,5 +1,4 @@
 import { openRadarCache } from './cache.js';
-import { listCompletedVolumes } from './nexrad-source.js';
 import { loadRadarDecoder } from './wasm-loader.js';
 import { FramePipeline } from './frame-pipeline.js';
 import { WorkerCore } from './worker-core.js';
@@ -41,7 +40,7 @@ async function init(message) {
   const engine = new RadarEngine();
   const cache = await openRadarCache({ onFallback: (error) => metric('warn', 'cache', 'CACHE_MEMORY_FALLBACK', 'IndexedDB unavailable; using memory cache', {}, error) });
   const pipeline = new FramePipeline({ cache, engine, fetchArrayBuffer, diagnostics });
-  const core = new WorkerCore({ role: 'priority', listVolumes: listCompletedVolumes, pipeline, diagnostics });
+  const core = new WorkerCore({ role: 'priority', pipeline, diagnostics });
   runtime = createWorkerRuntime({ core, post });
   initialized = true;
   metric('info', 'worker-init', 'PRIORITY_INIT_READY', 'Priority Level II worker ready', { elapsedMs: Date.now() - started });

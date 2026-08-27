@@ -1,3 +1,30 @@
+
+## Alpha full repository audit — 2026-08-27
+
+This pass audited the production tree end-to-end instead of treating each visible failure as an isolated decoder bug. Confirmed fixes include:
+
+- Decoder JS/WASM cache tokens now include the exact deployed Git SHA, preventing frontend/decoder version skew across Alpha pushes.
+- Dead priority/history workers are remembered as dead, invalidated, and recreated rather than reused after timeout/crash.
+- Decoder-session disposal/reset failures are retained in structured diagnostics.
+- History-worker failure is isolated from the priority decoder and history can restart with a fresh worker.
+- FramePipeline now guards overlapping loads with a generation token: an older archive download cannot finish late and replace newer decoder state.
+- The active decoded source stays usable while replacement bytes download and is swapped/released only when new bytes are ready to ingest.
+- Cache writes no longer block the first Level II sweep; IndexedDB open/read/write failure falls back to memory/uncached operation.
+- S3 XML body reads, catalog requests, map startup, worker requests, CI station discovery, and CI smoke downloads have explicit deadlines.
+- Prepared WMS sources are geographically bounded around the selected WSR-88D to avoid useless world-tile traffic.
+- One malformed bundled/WFS station record is skipped instead of discarding the valid catalog.
+- Deprecated NOAA ArcGIS catalog code and the duplicate worker-side `SELECT_SITE`/listing implementation were removed.
+- Rust PSWP geometry/layout uses checked arithmetic, checked `u32` offsets/counts, and a sweep-size sanity ceiling; production decoder code avoids panic-style `unwrap()`/`expect()` paths.
+- WebGL failures are separated into `E_GL_VERSION`, `E_GL_SHADER`, `E_GL_PROGRAM`, `E_GL_UPLOAD`, and `E_GL_RENDER`.
+- WASM loading distinguishes `E_WASM_IMPORT`, `E_WASM_INIT`, and `E_WASM_EXPORT`.
+- Real UI actions no longer swallow rejected operations; stale fatal diagnostics clear after recovery.
+- Live/history/frame-selection races are token-guarded so obsolete work cannot yank the map or timestamp backward.
+- Browser release smoke clicks a real map radar marker and then proves both prepared imagery and the real current Level II WASM/WebGL path.
+- Current-frame timestamp is 17px/850 weight.
+- CI radar-catalog refresh and current-volume smoke networking are bounded so an external hang cannot consume the entire workflow timeout.
+
+Known unresolved build-reproducibility limitation: the source still has no `package-lock.json` or `decoder/Cargo.lock`. They must be generated from a machine with npm/Cargo registry access; this environment cannot do so reliably and no fake lockfiles are included.
+
 # PersonalNWS Alpha — 2026-08-26
 
 PersonalNWS Alpha replaces the old decoder-first radar startup architecture while preserving the existing PersonalNWS map/UI appearance.
@@ -31,7 +58,7 @@ PersonalNWS Alpha replaces the old decoder-first radar startup architecture whil
 
 ## Alpha WMS fast-lane hotfix — 2026-08-27
 
-- Fixed the NWS GeoServer GetMap URL builder. The Alpha fast lane had requested bare `layers=SR_BREF` / `SR_BVEL` from the station workspace, which returned an OGC service-exception XML document instead of a PNG.
+- Fixed the NWS GeoServer GetMap URL builder. The Alpha prepared-radar source had requested bare `layers=SR_BREF` / `SR_BVEL` from the station workspace, which returned an OGC service-exception XML document instead of a PNG.
 - Fast radar now uses the station-scoped resource/layer naming convention, e.g. KDIX reflectivity uses `/geoserver/kdix/kdix_sr_bref/ows` with `layers=kdix_sr_bref`; velocity uses the corresponding `<site>_sr_bvel` resource.
 - Added regression coverage for arbitrary WSR-88D IDs (including Alaska) so this is a network-wide fix rather than a KDIX special case.
 - Improved the real-browser release smoke test: if NWS returns non-PNG content, GitHub Actions now prints the WMS URL, content type, and the first 4 KB of the OGC exception body instead of only reporting a MIME mismatch.
@@ -120,7 +147,7 @@ For true lowest-latency live radar, the next architecture step is to wire the ex
 
 - Fixed Alpha deploy staleness: the real-browser radar smoke test is now diagnostic/non-blocking, so a smoke failure no longer leaves GitHub Pages serving the previous release.
 - Added the GitHub commit SHA to runtime diagnostics (`buildId`) so the deployed code can be verified directly.
-- Added a Copy Debug Report button to fatal diagnostics and slightly increased the bottom current-frame timestamp to 16px/850 weight.
+- Added a Copy Debug Report button to fatal diagnostics and slightly increased the bottom current-frame timestamp to 17px/850 weight.
 
 ## Alpha deployment identity repair
 
