@@ -1,0 +1,111 @@
+name: Build and deploy PersonalNWS Alpha — Stage 1
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build PersonalNWS frontend
+        env:
+          VITE_BUILD_ID: ${{ github.sha }}
+        run: npm run build
+
+      - name: Stamp Pages build identity
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const info = { release: 'Alpha', stage: 1, gitSha: process.env.GIT_SHA, builtAt: new Date().toISOString() };
+          fs.writeFileSync('dist/build-info.json', `${JSON.stringify(info, null, 2)}\n`);
+          NODE
+
+      - name: Audit final Stage 1 artifact
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -f dist/index.html
+          test -f dist/build-info.json
+          grep -Fq '<title>PersonalNWS Alpha</title>' dist/index.html
+          grep -Fq 'Copy Debug Report' dist/index.html
+          grep -R -Fq '#timeNow{font-size:17px;font-weight:850' dist/assets
+          grep -R -Fq "$GIT_SHA" dist/assets
+          grep -Fq '"stage": 1' dist/build-info.json
+          if find dist -type f \( -name '*.wasm' -o -name '*decoder*' -o -name '*worker*' \) | grep -q .; then
+            echo 'Stage 1 artifact unexpectedly contains decoder/worker files' >&2
+            exit 1
+          fi
+
+      - name: Install Chromium for frontend smoke test
+        run: npx playwright install --with-deps chromium
+
+      - name: Run frontend browser smoke
+        run: npm run test:browser -- tests/browser/frontend-shell.spec.js
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Verify live Stage 1 deployment
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="${PAGE_URL%/}"
+          for attempt in {1..12}; do
+            info="$(curl -fsSL -H 'Cache-Control: no-cache' "$base/build-info.json?build=$GITHUB_SHA" 2>/dev/null || true)"
+            html="$(curl -fsSL -H 'Cache-Control: no-cache' "$base/?build=$GITHUB_SHA" 2>/dev/null || true)"
+            if [[ "$info" == *"$GITHUB_SHA"* ]] && [[ "$info" == *'"stage": 1'* ]] && [[ "$html" == *'<title>PersonalNWS Alpha</title>'* ]]; then
+              echo "Live Pages origin is serving Stage 1 from $GITHUB_SHA"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Live Pages did not serve Stage 1 commit $GITHUB_SHA after 60 seconds"
+          exit 1
