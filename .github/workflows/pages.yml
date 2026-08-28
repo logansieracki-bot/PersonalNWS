@@ -57,6 +57,9 @@ jobs:
           test -f dist/index.html
           test -f dist/build-info.json
           grep -Fq '<title>PersonalNWS Alpha</title>' dist/index.html
+          grep -Fq '<meta name="application-name" content="PersonalNWS Alpha">' dist/index.html
+          grep -Fq '<meta name="apple-mobile-web-app-title" content="PersonalNWS Alpha">' dist/index.html
+          grep -Fq '"short_name": "PersonalNWS Alpha"' dist/manifest.webmanifest
           grep -Fq 'Copy Debug Report' dist/index.html
           grep -R -Fq '#timeNow{font-size:17px;font-weight:850' dist/assets
           grep -R -Fq "$GIT_SHA" dist/assets
@@ -101,7 +104,8 @@ jobs:
           for attempt in {1..12}; do
             info="$(curl -fsSL -H 'Cache-Control: no-cache' "$base/build-info.json?build=$GITHUB_SHA" 2>/dev/null || true)"
             html="$(curl -fsSL -H 'Cache-Control: no-cache' "$base/?build=$GITHUB_SHA" 2>/dev/null || true)"
-            if [[ "$info" == *"$GITHUB_SHA"* ]] && [[ "$info" == *'"stage": 1'* ]] && [[ "$html" == *'<title>PersonalNWS Alpha</title>'* ]]; then
+            manifest="$(curl -fsSL -H 'Cache-Control: no-cache' "$base/manifest.webmanifest?build=$GITHUB_SHA" 2>/dev/null || true)"
+            if [[ "$info" == *"$GITHUB_SHA"* ]] && [[ "$info" == *'"stage": 1'* ]] && [[ "$html" == *'<title>PersonalNWS Alpha</title>'* ]] && [[ "$manifest" == *'"short_name": "PersonalNWS Alpha"'* ]]; then
               echo "Live Pages origin is serving Stage 1 from $GITHUB_SHA"
               exit 0
             fi
