@@ -1,8 +1,0 @@
-[
- {"id":"KDOX","name":"Dover AFB","state":"DE","country":"US","lat":38.8258,"lon":-75.4401},
- {"id":"KTLX","name":"Oklahoma City","state":"OK","country":"US","lat":35.3331,"lon":-97.2775},
- {"id":"PAHG","name":"Anchorage","state":"AK","country":"US","lat":60.7259,"lon":-151.3515},
- {"id":"PHKI","name":"Kauai","state":"HI","country":"US","lat":21.8939,"lon":-159.5525},
- {"id":"TJUA","name":"San Juan","state":"PR","country":"US","lat":18.1156,"lon":-66.0781},
- {"id":"PGUA","name":"Guam","state":"GU","country":"US","lat":13.4559,"lon":144.8111}
-]
