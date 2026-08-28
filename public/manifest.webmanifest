@@ -1,0 +1,8 @@
+{
+  "name": "PersonalNWS Alpha",
+  "short_name": "PersonalNWS Alpha",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#050506",
+  "theme_color": "#050506"
+}
